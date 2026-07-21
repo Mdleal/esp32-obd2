@@ -42,6 +42,125 @@ jobs:
           mkdir -p sketch/esp32-obd2
           cp esp32-obd2.ino sketch/esp32-obd2/esp32-obd2.ino
           arduino-cli compile \
+            --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs \
+            --export-binaries \
+            sketch/esp32-obd2
+
+      - name: Merge into one flashable file
+        run: |
+          python3 -m pip install --quiet esptool
+          BUILD=sketch/esp32-obd2/build/esp32.esp32.esp32
+          BOOT_APP0=$(find "$HOME/.arduino15/packages/esp32/hardware/esp32" -name boot_app0.bin | head -n1)
+          mkdir -p site
+          python3 -m esptool --chip esp32 merge_bin \
+            -o site/firmware.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000  "$BUILD"/*.bootloader.bin \
+            0x8000  "$BUILD"/*.partitions.bin \
+            0xe000  "$BOOT_APP0" \
+            0x10000 "$BUILD"/*.ino.bin
+          # Also keep the plain app image for later over-the-air (/update) updates
+          cp "$BUILD"/*.ino.bin site/app-ota.bin
+          ls -la site
+
+      - name: Build the web flasher page
+        run: |
+          cat > site/manifest.json <<'EOF'
+          {
+            "name": "ESP32 OBD2",
+            "version": "1.0.0",
+            "new_install_prompt_erase": true,
+            "builds": [
+              { "chipFamily": "ESP32", "parts": [ { "path": "firmware.bin", "offset": 0 } ] }
+            ]
+          }
+          EOF
+          cat > site/index.html <<'EOF'
+          <!DOCTYPE html><html><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Flash ESP32 OBD2</title>
+          <style>body{font-family:system-ui;max-width:640px;margin:40px auto;padding:0 16px;line-height:1.5}</style>
+          </head><body>
+          <h1>Flash your ESP32 OBD2 firmware</h1>
+          <ol>
+            <li>Use <b>Chrome</b> or <b>Edge</b> on a desktop/laptop.</li>
+            <li>Plug the ESP32 into this computer with a USB cable.</li>
+            <li>Click <b>Install</b>, pick the ESP32's serial port, and confirm.</li>
+          </ol>
+          <p><esp-web-install-button manifest="manifest.json">
+            <button slot="activate">Install</button>
+          </esp-web-install-button></p>
+          <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+          </body></html>
+          EOF
+
+      - name: Save firmware as a downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-bin
+          path: |
+            site/firmware.bin
+            site/app-ota.bin
+
+      - name: Upload website
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy-flasher:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish web flasher page
+        id: deployment
+        uses: actions/deploy-pages@v4
+name: Build firmware
+
+# Runs automatically on every push, and can be run by hand from the Actions tab.
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Install arduino-cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh -s
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+
+      - name: Install ESP32 board support
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+
+      - name: Install libraries
+        run: |
+          arduino-cli lib install "ELMduino"
+          arduino-cli lib install "WiFiManager"
+          arduino-cli lib install "PubSubClient"
+          arduino-cli lib install "ElegantOTA"
+
+      - name: Assemble sketch folder and compile
+        run: |
+          # arduino-cli needs the .ino inside a folder of the same name.
+          mkdir -p sketch/esp32-obd2
+          cp esp32-obd2.ino sketch/esp32-obd2/esp32-obd2.ino
+          arduino-cli compile \
             --fqbn esp32:esp32:esp32 \
             --export-binaries \
             sketch/esp32-obd2
