@@ -32,6 +32,7 @@
 #include <WiFiManager.h>
 #include <PubSubClient.h>
 #include <ElegantOTA.h>
+#include "esp_system.h"
 
 // ----------------------------------------------------------------------------
 // Compile-time guards
@@ -132,7 +133,16 @@ void saveConfigCallback() { shouldSaveConfig = true; }
 // ----------------------------------------------------------------------------
 void setupWiFi() {
   WiFiManager wm;
+  wm.setDebugOutput(true);                    // verbose WiFiManager logs over serial
   wm.setSaveConfigCallback(saveConfigCallback);
+  wm.setAPCallback([](WiFiManager* w) {
+    Serial.println(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+    Serial.println(">>> CONFIG PORTAL IS UP");
+    Serial.println(">>> Join WiFi network: 'ESP32-OBD2'  (password: obd2setup)");
+    Serial.print  (">>> Then open a browser to: http://");
+    Serial.println(WiFi.softAPIP());
+    Serial.println(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+  });
 
   WiFiManagerParameter p_host("host", "MQTT host (blank = Prometheus only)", mqttHost, sizeof(mqttHost));
   WiFiManagerParameter p_port("port", "MQTT port", mqttPort, sizeof(mqttPort));
@@ -150,11 +160,15 @@ void setupWiFi() {
   wm.addParameter(&p_bt);
   wm.addParameter(&p_pin);
 
-  wm.setConfigPortalTimeout(300); // 5 min then reboot & retry saved creds
+  wm.setConfigPortalTimeout(0);   // 0 = never time out; stay in portal until configured
 
   // AP name "ESP32-OBD2", password "obd2setup"
-  if (!wm.autoConnect("ESP32-OBD2", "obd2setup")) {
-    Serial.println("WiFi connect failed; rebooting.");
+  Serial.println("Calling wm.autoConnect('ESP32-OBD2') ...");
+  Serial.println("  (if there are NO saved WiFi creds, the portal AP should appear within a few seconds)");
+  bool ok = wm.autoConnect("ESP32-OBD2", "obd2setup");
+  Serial.printf("autoConnect() returned: %s\n", ok ? "CONNECTED to WiFi" : "NOT connected");
+  if (!ok) {
+    Serial.println("Config portal timed out; rebooting.");
     delay(2000);
     ESP.restart();
   }
@@ -338,10 +352,18 @@ void mqttReconnect() {
 // ----------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  delay(500);
-  Serial.println("\nESP32 OBD2 exporter starting...");
+  delay(1500);
+  Serial.println("\n\n==================================");
+  Serial.println("   ESP32 OBD2 exporter  BOOT");
+  Serial.println("==================================");
+  int rr = (int)esp_reset_reason();
+  Serial.printf("Reset reason code: %d  (1=power-on, 4=panic/crash, 6=task-wdt, 12=BROWNOUT/low-power)\n", rr);
+  if (rr == 12) Serial.println("!!! BROWNOUT detected -- the USB port/cable may not supply enough power. Try a different cable/port or powered hub.");
+  Serial.printf("Free heap: %u bytes | SDK: %s\n", ESP.getFreeHeap(), ESP.getSdkVersion());
 
   loadConfig();
+  Serial.printf("Loaded config -> MQTT host:'%s'  BT MAC:'%s'\n", mqttHost, btMac);
+  Serial.println("Starting WiFi setup (captive portal if no saved WiFi)...");
   setupWiFi();
 
   server.on("/", handleRoot);
@@ -356,6 +378,17 @@ void setup() {
 void loop() {
   server.handleClient();
   ElegantOTA.loop();
+
+  // Heartbeat: prints status every 10s so we can see the board is alive & connected
+  static unsigned long lastBeat = 0;
+  if (millis() - lastBeat > 10000) {
+    lastBeat = millis();
+    Serial.printf("[beat] up=%lus  heap=%u  WiFi=%s  IP=%s  BT=%d  ELM=%d\n",
+                  millis() / 1000, ESP.getFreeHeap(),
+                  WiFi.status() == WL_CONNECTED ? "yes" : "no",
+                  WiFi.localIP().toString().c_str(),
+                  btConnected, elmReady);
+  }
 
   // Keep OBD2 link alive
   if (!btConnected || !elmReady) {
