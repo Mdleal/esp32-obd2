@@ -100,6 +100,10 @@ const unsigned long LOG_INTERVAL    = 2000;   // snapshot every 2s
 const unsigned long UPLOAD_INTERVAL = 15000;  // try to flush every 15s
 const float KMH_TO_MPH = 0.621371f;
 
+// InfluxDB upload health (shown on status page)
+int lastInfluxCode = 0;              // 0 = no upload attempted yet; 200/204 = ok; else error
+unsigned long lastInfluxMs = 0;     // millis() of last upload attempt
+
 // ---------------- Config load/save ----------------
 void loadConfig() {
   prefs.begin("logger", true);
@@ -331,6 +335,8 @@ void flushBuffer() {
   code = http.sendRequest("POST", &f, sz);   // streams file as body (no big RAM use)
   f.close();
   http.end();
+  lastInfluxCode = code;
+  lastInfluxMs = millis();
 
   if (code == 204 || code == 200) {
     SD.remove(UP);
@@ -353,7 +359,11 @@ void handleRoot() {
   h += "<p>GPS sats: " + String(g_sats) + " | fix: " + String(!isnan(g_lat)?"yes":"no") + "</p>";
   h += "<p>WiFi: " + String(WiFi.status()==WL_CONNECTED?WiFi.localIP().toString():"down") + "</p>";
   h += "<p>SD: " + String(sdOk?"ok":"FAIL") + " | buffered: " + String(bufBytes()) + " bytes</p>";
-  h += "<p>InfluxDB: " + String(influxHost) + ":" + String(influxPort) + " / " + String(influxBucket) + "</p>";
+  String ist;
+  if (lastInfluxCode == 0)                          ist = "no upload yet";
+  else if (lastInfluxCode == 200 || lastInfluxCode == 204) ist = "CONNECTED (last OK " + String((millis()-lastInfluxMs)/1000) + "s ago)";
+  else                                              ist = "ERROR (HTTP " + String(lastInfluxCode) + ")";
+  h += "<p>InfluxDB: " + String(influxHost) + ":" + String(influxPort) + " / " + String(influxBucket) + " &mdash; " + ist + "</p>";
   h += "<p>Latest: RPM " + String(v_rpm,0) + ", " + String(v_speedMph,1) + " mph, coolant " + String(v_coolant,0) + "C</p>";
   h += "<p><a href='/config'>/config</a> (edit InfluxDB) &middot; <a href='/update'>/update</a> (OTA)</p></body></html>";
   server.send(200, "text/html", h);
