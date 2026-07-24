@@ -34,14 +34,14 @@ jobs:
           mkdir -p sketch/esp32-obd2-logger
           cp esp32-obd2-logger.ino sketch/esp32-obd2-logger/esp32-obd2-logger.ino
           arduino-cli compile \
-            --fqbn esp32:esp32:lolin_d32_pro:PartitionScheme=min_spiffs \
+            --fqbn esp32:esp32:esp32:PSRAM=enabled,PartitionScheme=min_spiffs \
             --export-binaries \
             sketch/esp32-obd2-logger
 
       - name: Merge into one flashable file
         run: |
           python3 -m pip install --quiet esptool
-          BUILD=sketch/esp32-obd2-logger/build/esp32.esp32.lolin_d32_pro
+          BUILD=sketch/esp32-obd2-logger/build/esp32.esp32.esp32
           BOOT_APP0=$(find "$HOME/.arduino15/packages/esp32/hardware/esp32" -name boot_app0.bin | head -n1)
           mkdir -p out
           python3 -m esptool --chip esp32 merge_bin \
