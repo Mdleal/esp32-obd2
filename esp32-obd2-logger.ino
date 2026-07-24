@@ -19,7 +19,7 @@
  *     retried; fresh data keeps appending to a new /buffer.lp meanwhile.
  *
  * First-boot config: captive-portal AP "ESP32-LOGGER" (pw: loggersetup).
- * Enter WiFi + InfluxDB (host/port/org/bucket/token) + OBD MAC. Saved to flash.
+ * Enter WiFi + InfluxDB (host/port/org/bucket/token) + OBD MAC/PIN. Saved to flash.
  * After it is on WiFi, settings can be edited any time at http://<board-ip>/config
  *
  * Wiring (LoLin D32 Pro):
@@ -143,10 +143,11 @@ void setupWiFi() {
   WiFiManagerParameter p_bkt  ("ibkt",   "InfluxDB bucket",   influxBucket,sizeof(influxBucket));
   WiFiManagerParameter p_tok  ("itok",   "InfluxDB API token",influxToken, sizeof(influxToken));
   WiFiManagerParameter p_mac  ("mac",    "OBD2 Bluetooth MAC",btMac,       sizeof(btMac));
+  WiFiManagerParameter p_pin  ("pin",    "OBD2 Bluetooth PIN",btPin,       sizeof(btPin));
   WiFiManagerParameter p_veh  ("veh",    "Vehicle name/tag",  vehicleId,   sizeof(vehicleId));
   wm.addParameter(&p_host); wm.addParameter(&p_port); wm.addParameter(&p_org);
   wm.addParameter(&p_bkt);  wm.addParameter(&p_tok);  wm.addParameter(&p_mac);
-  wm.addParameter(&p_veh);
+  wm.addParameter(&p_pin);  wm.addParameter(&p_veh);
 
   wm.setConfigPortalTimeout(0);  // stay until configured
   Serial.println("autoConnect('ESP32-LOGGER')...");
@@ -160,6 +161,7 @@ void setupWiFi() {
     strncpy(influxBucket,p_bkt.getValue(),  sizeof(influxBucket));
     strncpy(influxToken, p_tok.getValue(),  sizeof(influxToken));
     strncpy(btMac,       p_mac.getValue(),  sizeof(btMac));
+    strncpy(btPin,       p_pin.getValue(),  sizeof(btPin));
     strncpy(vehicleId,   p_veh.getValue(),  sizeof(vehicleId));
     saveConfig();
     Serial.println("Config saved.");
@@ -368,6 +370,7 @@ void handleConfig() {
   h += "Token (leave blank to keep current): <input name='token' value='' size='50'><br><br>";
   h += "Vehicle tag: <input name='veh' value='" + String(vehicleId) + "'><br><br>";
   h += "OBD2 Bluetooth MAC: <input name='mac' value='" + String(btMac) + "'><br><br>";
+  h += "OBD2 Bluetooth PIN: <input name='pin' value='" + String(btPin) + "'><br><br>";
   h += "<input type='submit' value='Save'></form>";
   h += "<p><a href='/'>&larr; status</a></p></body></html>";
   server.send(200, "text/html", h);
@@ -381,6 +384,7 @@ void handleSave() {
     snprintf(influxToken, sizeof(influxToken), "%s", server.arg("token").c_str());
   if (server.hasArg("veh"))    snprintf(vehicleId,    sizeof(vehicleId),    "%s", server.arg("veh").c_str());
   if (server.hasArg("mac"))    snprintf(btMac,        sizeof(btMac),        "%s", server.arg("mac").c_str());
+  if (server.hasArg("pin"))    snprintf(btPin,        sizeof(btPin),        "%s", server.arg("pin").c_str());
   saveConfig();
   Serial.println("Config updated via web page.");
   String h = "<html><body><h2>Saved.</h2>";
