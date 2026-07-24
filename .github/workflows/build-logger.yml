@@ -1,0 +1,63 @@
+name: Build logger firmware
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install arduino-cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh -s
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+
+      - name: Install ESP32 board support
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+
+      - name: Install libraries
+        run: |
+          arduino-cli lib install "ELMduino"
+          arduino-cli lib install "WiFiManager"
+          arduino-cli lib install "TinyGPSPlus"
+          arduino-cli lib install "ElegantOTA"
+
+      - name: Assemble sketch folder and compile
+        run: |
+          mkdir -p sketch/esp32-obd2-logger
+          cp esp32-obd2-logger.ino sketch/esp32-obd2-logger/esp32-obd2-logger.ino
+          arduino-cli compile \
+            --fqbn esp32:esp32:lolin_d32_pro:PartitionScheme=min_spiffs \
+            --export-binaries \
+            sketch/esp32-obd2-logger
+
+      - name: Merge into one flashable file
+        run: |
+          python3 -m pip install --quiet esptool
+          BUILD=sketch/esp32-obd2-logger/build/esp32.esp32.lolin_d32_pro
+          BOOT_APP0=$(find "$HOME/.arduino15/packages/esp32/hardware/esp32" -name boot_app0.bin | head -n1)
+          mkdir -p out
+          python3 -m esptool --chip esp32 merge_bin \
+            -o out/logger-firmware.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000  "$BUILD"/*.bootloader.bin \
+            0x8000  "$BUILD"/*.partitions.bin \
+            0xe000  "$BOOT_APP0" \
+            0x10000 "$BUILD"/*.ino.bin
+          cp "$BUILD"/*.ino.bin out/logger-app-ota.bin
+          ls -la out
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: logger-firmware
+          path: |
+            out/logger-firmware.bin
+            out/logger-app-ota.bin
