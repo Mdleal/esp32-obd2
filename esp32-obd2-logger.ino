@@ -20,6 +20,7 @@
  *
  * First-boot config: captive-portal AP "ESP32-LOGGER" (pw: loggersetup).
  * Enter WiFi + InfluxDB (host/port/org/bucket/token) + OBD MAC. Saved to flash.
+ * After it is on WiFi, settings can be edited any time at http://<board-ip>/config
  *
  * Wiring (LoLin D32 Pro):
  *   microSD  -> on-board slot (VSPI: SCK=18 MISO=19 MOSI=23  CS=GPIO4)
@@ -27,7 +28,7 @@
  *   GPS  TX  -> GPIO25 (ESP RX)      GPS RX -> GPIO26 (ESP TX, optional)
  *   NOTE: GPIO16/17 are used by PSRAM on WROVER -- do NOT use them for GPS.
  *
- * Build: FQBN esp32:esp32:lolin_d32_pro:PartitionScheme=min_spiffs
+ * Build: generic esp32 board (WROVER), FQBN esp32:esp32:esp32:PSRAM=enabled,PartitionScheme=min_spiffs
  * Libraries: ELMduino, WiFiManager, TinyGPSPlus, ElegantOTA (+ core SD/HTTPClient)
  */
 
@@ -352,7 +353,39 @@ void handleRoot() {
   h += "<p>SD: " + String(sdOk?"ok":"FAIL") + " | buffered: " + String(bufBytes()) + " bytes</p>";
   h += "<p>InfluxDB: " + String(influxHost) + ":" + String(influxPort) + " / " + String(influxBucket) + "</p>";
   h += "<p>Latest: RPM " + String(v_rpm,0) + ", " + String(v_speedMph,1) + " mph, coolant " + String(v_coolant,0) + "C</p>";
-  h += "<p><a href='/update'>/update</a> (OTA)</p></body></html>";
+  h += "<p><a href='/config'>/config</a> (edit InfluxDB) &middot; <a href='/update'>/update</a> (OTA)</p></body></html>";
+  server.send(200, "text/html", h);
+}
+
+// ---------------- Config web page (edit settings while on WiFi) ----------------
+void handleConfig() {
+  String h = "<html><body><h2>Logger Configuration</h2>";
+  h += "<form method='POST' action='/save'>";
+  h += "InfluxDB host: <input name='host' value='" + String(influxHost) + "'><br><br>";
+  h += "Port: <input name='port' value='" + String(influxPort) + "'><br><br>";
+  h += "Org: <input name='org' value='" + String(influxOrg) + "'><br><br>";
+  h += "Bucket: <input name='bucket' value='" + String(influxBucket) + "'><br><br>";
+  h += "Token (leave blank to keep current): <input name='token' value='' size='50'><br><br>";
+  h += "Vehicle tag: <input name='veh' value='" + String(vehicleId) + "'><br><br>";
+  h += "OBD2 Bluetooth MAC: <input name='mac' value='" + String(btMac) + "'><br><br>";
+  h += "<input type='submit' value='Save'></form>";
+  h += "<p><a href='/'>&larr; status</a></p></body></html>";
+  server.send(200, "text/html", h);
+}
+void handleSave() {
+  if (server.hasArg("host"))   snprintf(influxHost,   sizeof(influxHost),   "%s", server.arg("host").c_str());
+  if (server.hasArg("port"))   snprintf(influxPort,   sizeof(influxPort),   "%s", server.arg("port").c_str());
+  if (server.hasArg("org"))    snprintf(influxOrg,    sizeof(influxOrg),    "%s", server.arg("org").c_str());
+  if (server.hasArg("bucket")) snprintf(influxBucket, sizeof(influxBucket), "%s", server.arg("bucket").c_str());
+  if (server.hasArg("token") && server.arg("token").length() > 0)
+    snprintf(influxToken, sizeof(influxToken), "%s", server.arg("token").c_str());
+  if (server.hasArg("veh"))    snprintf(vehicleId,    sizeof(vehicleId),    "%s", server.arg("veh").c_str());
+  if (server.hasArg("mac"))    snprintf(btMac,        sizeof(btMac),        "%s", server.arg("mac").c_str());
+  saveConfig();
+  Serial.println("Config updated via web page.");
+  String h = "<html><body><h2>Saved.</h2>";
+  h += "<p>Now sending to: " + String(influxHost) + ":" + String(influxPort) + " / bucket " + String(influxBucket) + "</p>";
+  h += "<p><a href='/config'>&larr; edit again</a> &middot; <a href='/'>status</a></p></body></html>";
   server.send(200, "text/html", h);
 }
 
@@ -378,9 +411,11 @@ void setup() {
   setupWiFi();
 
   server.on("/", handleRoot);
+  server.on("/config", handleConfig);
+  server.on("/save", HTTP_POST, handleSave);
   ElegantOTA.begin(&server);
   server.begin();
-  Serial.println("HTTP server up (/, /update).");
+  Serial.println("HTTP server up (/, /config, /update).");
 
   connectOBD();
 }
