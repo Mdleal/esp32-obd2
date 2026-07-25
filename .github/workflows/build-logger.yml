@@ -31,7 +31,6 @@ jobs:
           arduino-cli lib install "ELMduino"
           arduino-cli lib install "WiFiManager"
           arduino-cli lib install "TinyGPSPlus"
-          arduino-cli lib install "ElegantOTA"
 
       - name: Assemble sketch folder and compile
         run: |

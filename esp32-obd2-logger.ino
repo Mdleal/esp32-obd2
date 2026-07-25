@@ -17,7 +17,7 @@
  *   NOTE: GPIO16/17 are used by PSRAM on WROVER -- do NOT use them for GPS.
  *
  * Build: generic esp32 (WROVER), FQBN esp32:esp32:esp32:PSRAM=enabled,PartitionScheme=min_spiffs
- * Libraries: ELMduino, WiFiManager, TinyGPSPlus, ElegantOTA (+ core SD/HTTPClient/HTTPUpdate)
+ * Libraries: ELMduino, WiFiManager, TinyGPSPlus (+ core SD/HTTPClient/HTTPUpdate)
  */
 
 #include <WiFi.h>
@@ -32,7 +32,6 @@
 #include "ELMduino.h"
 #include <WiFiManager.h>
 #include <TinyGPSPlus.h>
-#include <ElegantOTA.h>
 #include <HTTPUpdate.h>
 #include <time.h>
 #include <sys/time.h>
@@ -496,7 +495,7 @@ void handleRoot() {
     }
   }
 
-  h += "<p><a href='/config'>/config</a> (edit settings) &middot; <a href='/update'>/update</a> (manual OTA)</p></body></html>";
+  h += "<p><a href='/config'>/config</a> (edit settings)</p></body></html>";
   server.send(200, "text/html", h);
 }
 
@@ -598,16 +597,14 @@ void setup() {
   server.on("/save", HTTP_POST, handleSave);
   server.on("/checkupdate", HTTP_POST, handleCheckUpdate);
   server.on("/doupdate", HTTP_POST, handleDoUpdate);
-  ElegantOTA.begin(&server);
   server.begin();
-  Serial.println("HTTP server up (/, /config, /checkupdate, /update).");
+  Serial.println("HTTP server up (/, /config, /checkupdate).");
 
   connectOBD();
 }
 
 void loop() {
   server.handleClient();
-  ElegantOTA.loop();
   feedGPS();
 
   // Loop-rate counter (CPU-headroom proxy) + SD auto-retry if it failed to mount
