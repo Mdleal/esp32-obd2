@@ -11,6 +11,7 @@
  *   - If WiFi + InfluxDB are reachable, the buffer is flushed to the server.
  *   - If offline, lines accumulate on the microSD card and are uploaded
  *     automatically once WiFi returns -- so no data is lost in dead zones.
+ *   - Every 60s it reads stored DTCs and flags misfire codes (P0300-P030x).
  *
  * Store-and-forward design (crash-safe, keeps time order):
  *   - New points are always appended to  /buffer.lp  on the SD card.
@@ -81,11 +82,16 @@ HardwareSerial GPSserial(2);
 bool btConnected = false;
 bool elmReady    = false;
 
-// Latest OBD values (NAN = unknown)
+// Latest OBD values (NAN = unknown / unsupported by this car -> skipped in output)
 float v_rpm=NAN, v_speedMph=NAN, v_coolant=NAN, v_load=NAN, v_throttle=NAN,
       v_intake=NAN, v_maf=NAN, v_vbat=NAN, v_fuel=NAN;
+float v_stft=NAN, v_ltft=NAN, v_timing=NAN, v_map=NAN, v_modV=NAN,
+      v_runtime=NAN, v_ambient=NAN, v_oil=NAN;
+float v_mil=NAN, v_dtcCount=NAN, v_misfire=NAN;
 uint8_t pidState = 0;
-const uint8_t PID_COUNT = 9;
+const uint8_t PID_COUNT = 18;   // round-robin length (indices 0..17)
+unsigned long lastDtcMs = 0;
+const unsigned long DTC_INTERVAL = 60000;   // check trouble codes every 60s
 
 // GPS latest
 double g_lat=NAN, g_lon=NAN, g_alt=NAN, g_spdMph=NAN; uint32_t g_sats=0;
@@ -196,32 +202,77 @@ void connectOBD() {
 }
 void pollOBD() {
   if (!elmReady) return;
+
+  // Battery voltage (ATRV) -- blocking call, handle separately
   if (pidState == 7) { float bv=elm.batteryVoltage(); v_vbat=(bv>0)?bv:NAN; pidState=(pidState+1)%PID_COUNT; return; }
-  float val=NAN; bool done=false;
-  switch (pidState) {
-    case 0: val=elm.rpm(); break;
-    case 1: val=elm.kph(); break;
-    case 2: val=elm.engineCoolantTemp(); break;
-    case 3: val=elm.engineLoad(); break;
-    case 4: val=elm.throttle(); break;
-    case 5: val=elm.intakeAirTemp(); break;
-    case 6: val=elm.mafRate(); break;
-    case 8: val=elm.fuelLevel(); break;
+
+  // Monitor status (PID 0x01): MIL on/off + stored DTC count
+  if (pidState == 17) {
+    uint32_t ms = elm.monitorStatus();
+    if (elm.nb_rx_state == ELM_SUCCESS) {
+      uint8_t A = (ms >> 24) & 0xFF;   // byte A: bit7 = MIL, bits0-6 = DTC count
+      v_mil = (A & 0x80) ? 1 : 0;
+      v_dtcCount = (float)(A & 0x7F);
+    }
+    if (elm.nb_rx_state != ELM_GETTING_MSG) pidState=(pidState+1)%PID_COUNT;
+    return;
   }
+
+  float val=NAN;
+  switch (pidState) {
+    case 0:  val=elm.rpm();                   break;
+    case 1:  val=(float)elm.kph();            break;
+    case 2:  val=elm.engineCoolantTemp();     break;
+    case 3:  val=elm.engineLoad();            break;
+    case 4:  val=elm.throttle();              break;
+    case 5:  val=elm.intakeAirTemp();         break;
+    case 6:  val=elm.mafRate();               break;
+    case 8:  val=elm.fuelLevel();             break;
+    case 9:  val=elm.shortTermFuelTrimBank_1(); break;
+    case 10: val=elm.longTermFuelTrimBank_1();  break;
+    case 11: val=elm.timingAdvance();         break;
+    case 12: val=(float)elm.manifoldPressure(); break;
+    case 13: val=elm.ctrlModVoltage();        break;
+    case 14: val=(float)elm.runTime();        break;
+    case 15: val=elm.ambientAirTemp();        break;
+    case 16: val=elm.oilTemp();               break;
+  }
+  bool resolved=false;
   if (elm.nb_rx_state == ELM_SUCCESS) {
     switch (pidState) {
-      case 0: v_rpm=val; break;
-      case 1: v_speedMph=val*KMH_TO_MPH; break;
-      case 2: v_coolant=val; break;
-      case 3: v_load=val; break;
-      case 4: v_throttle=val; break;
-      case 5: v_intake=val; break;
-      case 6: v_maf=val; break;
-      case 8: v_fuel=val; break;
+      case 0:  v_rpm=val;              break;
+      case 1:  v_speedMph=val*KMH_TO_MPH; break;
+      case 2:  v_coolant=val;          break;
+      case 3:  v_load=val;             break;
+      case 4:  v_throttle=val;         break;
+      case 5:  v_intake=val;           break;
+      case 6:  v_maf=val;              break;
+      case 8:  v_fuel=val;             break;
+      case 9:  v_stft=val;             break;
+      case 10: v_ltft=val;             break;
+      case 11: v_timing=val;           break;
+      case 12: v_map=val;              break;
+      case 13: v_modV=val;             break;
+      case 14: v_runtime=val;          break;
+      case 15: v_ambient=val;          break;
+      case 16: v_oil=val;              break;
     }
-    done=true;
-  } else if (elm.nb_rx_state != ELM_GETTING_MSG) { done=true; }
-  if (done) pidState=(pidState+1)%PID_COUNT;
+    resolved=true;
+  } else if (elm.nb_rx_state != ELM_GETTING_MSG) {
+    resolved=true;   // error/unsupported -> keep old value, move on
+  }
+  if (resolved) pidState=(pidState+1)%PID_COUNT;
+}
+
+// Read stored DTCs (Mode 03, blocking) and flag misfire codes (P0300-P030x)
+void checkDTCs() {
+  elm.currentDTCCodes(true);
+  int mis = 0;
+  for (uint8_t i = 0; i < elm.DTC_Response.codesFound; i++) {
+    Serial.printf("DTC: %s\n", elm.DTC_Response.codes[i]);
+    if (strncmp(elm.DTC_Response.codes[i], "P030", 4) == 0) mis = 1;   // P0300-P0309 misfire
+  }
+  v_misfire = mis;
 }
 
 // ---------------- GPS ----------------
@@ -267,6 +318,12 @@ void logSnapshot() {
   addF(line,"throttle_pct",v_throttle,first); addF(line,"intake_c",v_intake,first);
   addF(line,"maf",v_maf,first);      addF(line,"battery_v",v_vbat,first);
   addF(line,"fuel_pct",v_fuel,first);
+  addF(line,"stft_b1",v_stft,first);      addF(line,"ltft_b1",v_ltft,first);
+  addF(line,"timing_adv",v_timing,first); addF(line,"map_kpa",v_map,first);
+  addF(line,"module_v",v_modV,first);     addF(line,"runtime_s",v_runtime,first);
+  addF(line,"ambient_c",v_ambient,first); addF(line,"oil_c",v_oil,first);
+  addF(line,"mil_on",v_mil,first);        addF(line,"dtc_count",v_dtcCount,first);
+  addF(line,"misfire",v_misfire,first);
   if (!first) { line += " "; line += ns2str(ns); line += "\n"; }
   else line = "";                                // no OBD fields -> skip obd line
 
@@ -365,6 +422,10 @@ void handleRoot() {
   else                                              ist = "ERROR (HTTP " + String(lastInfluxCode) + ")";
   h += "<p>InfluxDB: " + String(influxHost) + ":" + String(influxPort) + " / " + String(influxBucket) + " &mdash; " + ist + "</p>";
   h += "<p>Latest: RPM " + String(v_rpm,0) + ", " + String(v_speedMph,1) + " mph, coolant " + String(v_coolant,0) + "C</p>";
+  String faults;
+  if (isnan(v_mil)) faults = "not read yet";
+  else faults = String(v_mil>0.5?"MIL ON":"MIL off") + ", " + String((int)v_dtcCount) + " code(s)" + (v_misfire>0.5 ? ", MISFIRE code present" : "");
+  h += "<p>Faults: " + faults + "</p>";
   h += "<p><a href='/config'>/config</a> (edit InfluxDB) &middot; <a href='/update'>/update</a> (OTA)</p></body></html>";
   server.send(200, "text/html", h);
 }
@@ -444,6 +505,12 @@ void loop() {
     if (millis() - lastConnTryMs > 5000) { lastConnTryMs = millis(); elmReady=false; connectOBD(); }
   } else {
     pollOBD();
+  }
+
+  // Periodic trouble-code / misfire check (blocking, runs once a minute)
+  if (elmReady && millis() - lastDtcMs > DTC_INTERVAL) {
+    lastDtcMs = millis();
+    checkDTCs();
   }
 
   // Snapshot to buffer
