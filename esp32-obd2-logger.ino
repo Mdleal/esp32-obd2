@@ -444,7 +444,7 @@ void handleRoot() {
   h += "<p><b>OBD link:</b> " + String(elmReady&&btConnected?"connected":"DISCONNECTED");
   h += " &nbsp; <b>GPS:</b> " + String(g_sats) + " sats, fix " + String(!isnan(g_lat)?"yes":"no");
   h += " &nbsp; <b>WiFi:</b> " + String(WiFi.status()==WL_CONNECTED?WiFi.localIP().toString():"down") + "</p>";
-  h += "<p><b>SD:</b> " + String(sdOk?"ok":"FAIL (check card / FAT32 / seating)") + " &nbsp; buffered: " + String(bufBytes()) + " bytes</p>";
+  h += "<p><b>SD:</b> " + String(sdOk?"ok":"FAIL (reformat FAT32 / reseat)") + " &nbsp; buffered: " + String(bufBytes()) + " bytes</p>";
   String ist;
   if (lastInfluxCode == 0)                          ist = "no upload yet";
   else if (lastInfluxCode == 200 || lastInfluxCode == 204) ist = "CONNECTED (last OK " + String((millis()-lastInfluxMs)/1000) + "s ago)";
@@ -581,10 +581,10 @@ void setup() {
 
   loadConfig();
 
-  // SD card
+  // SD card -- retry a few times; some cards need a moment after power-up
   SPI.begin(18, 19, 23, SD_CS);
-  sdOk = SD.begin(SD_CS);
-  Serial.printf("SD card: %s\n", sdOk ? "OK" : "FAILED (check card/insertion)");
+  for (int i = 0; i < 5 && !sdOk; i++) { sdOk = SD.begin(SD_CS); if (!sdOk) delay(400); }
+  Serial.printf("SD card: %s\n", sdOk ? "OK" : "FAILED (reformat FAT32 / reseat / check power)");
 
   // GPS UART
   GPSserial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
