@@ -2,7 +2,11 @@ name: Build logger firmware
 
 on:
   push:
+    branches: [logger]     # branch pushes only -> the release tag won't re-trigger us
   workflow_dispatch:
+
+permissions:
+  contents: write          # needed to publish the OTA release
 
 jobs:
   build:
@@ -33,6 +37,7 @@ jobs:
         run: |
           mkdir -p sketch/esp32-obd2-logger
           cp esp32-obd2-logger.ino sketch/esp32-obd2-logger/esp32-obd2-logger.ino
+          echo "#define FW_VERSION \"${GITHUB_SHA}\"" > sketch/esp32-obd2-logger/version.h
           arduino-cli compile \
             --fqbn esp32:esp32:esp32:PSRAM=enabled,PartitionScheme=min_spiffs \
             --export-binaries \
@@ -61,3 +66,12 @@ jobs:
           path: |
             out/logger-firmware.bin
             out/logger-app-ota.bin
+
+      - name: Publish release for OTA self-update
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo -n "${GITHUB_SHA}" > version.txt
+          gh release create logger-latest --target "${GITHUB_SHA}" \
+            -t "Logger latest build" -n "Automated OTA build" 2>/dev/null || true
+          gh release upload logger-latest out/logger-app-ota.bin version.txt --clobber

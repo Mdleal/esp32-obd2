@@ -3,24 +3,11 @@
  * ------------------------------------------------------------------
  * Board:  LoLin D32 Pro (ESP32-WROVER, classic ESP32 -> Bluetooth Classic OK)
  *
- * What it does:
- *   - Reads OBD2 PIDs from a Bluetooth-Classic ELM327 dongle (Veepeak).
- *   - Reads GPS (ATGM336H / NEO-6M) for accurate UTC time + location.
- *   - Every LOG_INTERVAL it snapshots OBD + GPS + ESP-health into InfluxDB
- *     line-protocol lines with a real timestamp.
- *   - If WiFi + InfluxDB are reachable, the buffer is flushed to the server.
- *   - If offline, lines accumulate on the microSD card and are uploaded
- *     automatically once WiFi returns -- so no data is lost in dead zones.
- *   - Every 60s it reads stored DTCs and flags misfire codes (P0300-P030x).
- *
- * Store-and-forward design (crash-safe, keeps time order):
- *   - New points are always appended to  /buffer.lp  on the SD card.
- *   - The uploader rotates  /buffer.lp -> /uploading.lp,  POSTs it to
- *     InfluxDB, and deletes it on HTTP 204. A failed/pending upload is
- *     retried; fresh data keeps appending to a new /buffer.lp meanwhile.
+ * Features: OBD2 over BT-Classic ELM327, GPS time+location, SD store-and-forward
+ * to InfluxDB, misfire/DTC detection, live dashboard, and manual OTA self-update
+ * (Check-for-update / Update-now buttons that pull from GitHub Releases).
  *
  * First-boot config: captive-portal AP "ESP32-LOGGER" (pw: loggersetup).
- * Enter WiFi + InfluxDB (host/port/org/bucket/token) + OBD MAC/PIN. Saved to flash.
  * After it is on WiFi, settings can be edited any time at http://<board-ip>/config
  *
  * Wiring (LoLin D32 Pro):
@@ -29,8 +16,8 @@
  *   GPS  TX  -> GPIO25 (ESP RX)      GPS RX -> GPIO26 (ESP TX, optional)
  *   NOTE: GPIO16/17 are used by PSRAM on WROVER -- do NOT use them for GPS.
  *
- * Build: generic esp32 board (WROVER), FQBN esp32:esp32:esp32:PSRAM=enabled,PartitionScheme=min_spiffs
- * Libraries: ELMduino, WiFiManager, TinyGPSPlus, ElegantOTA (+ core SD/HTTPClient)
+ * Build: generic esp32 (WROVER), FQBN esp32:esp32:esp32:PSRAM=enabled,PartitionScheme=min_spiffs
+ * Libraries: ELMduino, WiFiManager, TinyGPSPlus, ElegantOTA (+ core SD/HTTPClient/HTTPUpdate)
  */
 
 #include <WiFi.h>
@@ -46,9 +33,18 @@
 #include <WiFiManager.h>
 #include <TinyGPSPlus.h>
 #include <ElegantOTA.h>
+#include <HTTPUpdate.h>
 #include <time.h>
 #include <sys/time.h>
 #include "esp_system.h"
+
+// Firmware version (commit SHA) is injected by the CI build via version.h.
+#if __has_include("version.h")
+#include "version.h"
+#endif
+#ifndef FW_VERSION
+#define FW_VERSION "dev"
+#endif
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error "Bluetooth Classic required. Use a classic ESP32 (WROVER/WROOM), not S3/C3."
@@ -114,6 +110,13 @@ unsigned long lastInfluxMs = 0;     // millis() of last upload attempt
 uint32_t loopCount = 0;             // counts loop() iterations within the current second
 uint32_t loopRate = 0;             // loops/sec (proxy for CPU headroom)
 unsigned long lastRateMs = 0, lastSdRetryMs = 0;
+
+// OTA self-update (manual, from GitHub Releases)
+const char* VERSION_URL = "https://github.com/Mdleal/esp32-obd2/releases/download/logger-latest/version.txt";
+const char* BIN_URL     = "https://github.com/Mdleal/esp32-obd2/releases/download/logger-latest/logger-app-ota.bin";
+bool updateChecked  = false;       // has the user run a check this session?
+bool updateAvailable = false;      // latest != running
+char latestVersion[48] = "";
 
 // ---------------- Config load/save ----------------
 void loadConfig() {
@@ -481,7 +484,19 @@ void handleRoot() {
   h += "<li>Chip temp: " + String(temperatureRead(), 1) + " C (rough)</li>";
   h += "</ul>";
 
-  h += "<p><a href='/config'>/config</a> (edit settings) &middot; <a href='/update'>/update</a> (OTA)</p></body></html>";
+  h += "<h3>Firmware</h3>";
+  h += "<p>Running: " + String(FW_VERSION).substring(0, 12) + "</p>";
+  h += "<form method='POST' action='/checkupdate' style='display:inline'><button>Check for update</button></form>";
+  if (updateChecked) {
+    if (updateAvailable) {
+      h += " <b>Update available:</b> " + String(latestVersion).substring(0, 12);
+      h += " <form method='POST' action='/doupdate' style='display:inline'><button>Update now</button></form>";
+    } else {
+      h += " &mdash; up to date";
+    }
+  }
+
+  h += "<p><a href='/config'>/config</a> (edit settings) &middot; <a href='/update'>/update</a> (manual OTA)</p></body></html>";
   server.send(200, "text/html", h);
 }
 
@@ -519,13 +534,51 @@ void handleSave() {
   server.send(200, "text/html", h);
 }
 
+// ---------------- OTA self-update (manual) ----------------
+// Pause Bluetooth (frees ~40KB so the TLS fetch fits), grab latest version, resume BT.
+String fetchLatestVersion() {
+  SerialBT.end(); btConnected=false; elmReady=false; delay(150);
+  WiFiClientSecure c; c.setInsecure();
+  HTTPClient http; http.setConnectTimeout(8000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  String latest = "";
+  if (http.begin(c, VERSION_URL) && http.GET() == 200) latest = http.getString();
+  http.end();
+  latest.trim();
+  connectOBD();   // resume Bluetooth
+  return latest;
+}
+void handleCheckUpdate() {
+  String latest = fetchLatestVersion();
+  snprintf(latestVersion, sizeof(latestVersion), "%s", latest.c_str());
+  updateChecked = true;
+  updateAvailable = (latest.length() > 0 && latest != String(FW_VERSION));
+  Serial.printf("[OTA] check: running=%s latest=%s avail=%d\n", FW_VERSION, latestVersion, updateAvailable);
+  server.sendHeader("Location", "/");
+  server.send(303);   // back to dashboard
+}
+void handleDoUpdate() {
+  server.send(200, "text/html", "<html><body><h3>Updating...</h3><p>Downloading firmware and rebooting. Give it ~30s, then <a href='/'>reload</a>.</p></body></html>");
+  delay(300);
+  Serial.println("[OTA] Manual update starting; pausing Bluetooth for RAM.");
+  SerialBT.end(); btConnected=false; elmReady=false; delay(200);
+  WiFiClientSecure uc; uc.setInsecure();
+  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  httpUpdate.rebootOnUpdate(true);
+  t_httpUpdate_return r = httpUpdate.update(uc, BIN_URL);   // reboots on success
+  if (r == HTTP_UPDATE_FAILED) {
+    Serial.printf("[OTA] failed (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+    connectOBD();   // resume BT; user can retry
+  }
+}
+
 // ---------------- Setup / loop ----------------
 void setup() {
   Serial.begin(115200);
   delay(1200);
   setenv("TZ", "UTC0", 1); tzset();            // work in UTC for clean epoch timestamps
   Serial.println("\n==== ESP32 OBD2 Logger boot ====");
-  Serial.printf("Reset reason: %d | heap: %u\n", (int)esp_reset_reason(), ESP.getFreeHeap());
+  Serial.printf("FW %s | Reset reason: %d | heap: %u\n", FW_VERSION, (int)esp_reset_reason(), ESP.getFreeHeap());
 
   loadConfig();
 
@@ -543,9 +596,11 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/config", handleConfig);
   server.on("/save", HTTP_POST, handleSave);
+  server.on("/checkupdate", HTTP_POST, handleCheckUpdate);
+  server.on("/doupdate", HTTP_POST, handleDoUpdate);
   ElegantOTA.begin(&server);
   server.begin();
-  Serial.println("HTTP server up (/, /config, /update).");
+  Serial.println("HTTP server up (/, /config, /checkupdate, /update).");
 
   connectOBD();
 }
