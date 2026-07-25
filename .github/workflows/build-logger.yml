@@ -2,11 +2,12 @@ name: Build logger firmware
 
 on:
   push:
-    branches: [logger]     # branch pushes only -> the release tag won't re-trigger us
+    branches: [logger]
+    paths-ignore: ['firmware/**']   # don't re-trigger on the CI firmware commit
   workflow_dispatch:
 
 permissions:
-  contents: write          # needed to publish the OTA release
+  contents: write
 
 jobs:
   build:
@@ -66,11 +67,13 @@ jobs:
             out/logger-firmware.bin
             out/logger-app-ota.bin
 
-      - name: Publish release for OTA self-update
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Commit firmware for raw-served OTA
         run: |
-          echo -n "${GITHUB_SHA}" > version.txt
-          gh release create logger-latest --target "${GITHUB_SHA}" \
-            -t "Logger latest build" -n "Automated OTA build" 2>/dev/null || true
-          gh release upload logger-latest out/logger-app-ota.bin version.txt --clobber
+          mkdir -p firmware
+          cp out/logger-app-ota.bin firmware/logger-app-ota.bin
+          echo -n "${GITHUB_SHA}" > firmware/version.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add firmware/logger-app-ota.bin firmware/version.txt
+          git commit -m "CI: firmware ${GITHUB_SHA}" || echo "no changes"
+          git push origin HEAD:logger

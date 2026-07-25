@@ -5,7 +5,7 @@
  *
  * Features: OBD2 over BT-Classic ELM327, GPS time+location, SD store-and-forward
  * to InfluxDB, misfire/DTC detection, live dashboard, and manual OTA self-update
- * (Check-for-update / Update-now buttons that pull from GitHub Releases).
+ * (Check-for-update / Update-now buttons that pull firmware from raw.githubusercontent).
  *
  * First-boot config: captive-portal AP "ESP32-LOGGER" (pw: loggersetup).
  * After it is on WiFi, settings can be edited any time at http://<board-ip>/config
@@ -110,12 +110,13 @@ uint32_t loopCount = 0;             // counts loop() iterations within the curre
 uint32_t loopRate = 0;             // loops/sec (proxy for CPU headroom)
 unsigned long lastRateMs = 0, lastSdRetryMs = 0;
 
-// OTA self-update (manual, from GitHub Releases)
-const char* VERSION_URL = "https://github.com/Mdleal/esp32-obd2/releases/download/logger-latest/version.txt";
-const char* BIN_URL     = "https://github.com/Mdleal/esp32-obd2/releases/download/logger-latest/logger-app-ota.bin";
+// OTA self-update (manual). Served from raw.githubusercontent (direct, no redirect).
+const char* VERSION_URL = "https://raw.githubusercontent.com/Mdleal/esp32-obd2/logger/firmware/version.txt";
+const char* BIN_URL     = "https://raw.githubusercontent.com/Mdleal/esp32-obd2/logger/firmware/logger-app-ota.bin";
 bool updateChecked  = false;       // has the user run a check this session?
 bool updateAvailable = false;      // latest != running
 char latestVersion[48] = "";
+char lastCheckMsg[64] = "";        // human-readable result of the last check
 
 // ---------------- Config load/save ----------------
 void loadConfig() {
@@ -487,11 +488,12 @@ void handleRoot() {
   h += "<p>Running: " + String(FW_VERSION).substring(0, 12) + "</p>";
   h += "<form method='POST' action='/checkupdate' style='display:inline'><button>Check for update</button></form>";
   if (updateChecked) {
+    h += " &mdash; last check: " + String(lastCheckMsg);
     if (updateAvailable) {
-      h += " <b>Update available:</b> " + String(latestVersion).substring(0, 12);
+      h += " &mdash; <b>Update available:</b> " + String(latestVersion).substring(0, 12);
       h += " <form method='POST' action='/doupdate' style='display:inline'><button>Update now</button></form>";
-    } else {
-      h += " &mdash; up to date";
+    } else if (strlen(latestVersion) > 0) {
+      h += " (up to date)";
     }
   }
 
@@ -534,17 +536,19 @@ void handleSave() {
 }
 
 // ---------------- OTA self-update (manual) ----------------
-// Pause Bluetooth (frees ~40KB so the TLS fetch fits), grab latest version, resume BT.
+// Pause Bluetooth (frees ~40KB so the TLS fetch fits), grab latest version.
+// BT is left down on purpose; loop() re-connects it so the web server stays responsive.
 String fetchLatestVersion() {
   SerialBT.end(); btConnected=false; elmReady=false; delay(150);
   WiFiClientSecure c; c.setInsecure();
-  HTTPClient http; http.setConnectTimeout(8000);
+  HTTPClient http; http.setConnectTimeout(6000); http.setTimeout(6000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   String latest = "";
-  if (http.begin(c, VERSION_URL) && http.GET() == 200) latest = http.getString();
+  int code = -1;
+  if (http.begin(c, VERSION_URL)) { code = http.GET(); if (code == 200) latest = http.getString(); }
   http.end();
   latest.trim();
-  connectOBD();   // resume Bluetooth
+  snprintf(lastCheckMsg, sizeof(lastCheckMsg), "HTTP %d", code);
   return latest;
 }
 void handleCheckUpdate() {
@@ -552,7 +556,7 @@ void handleCheckUpdate() {
   snprintf(latestVersion, sizeof(latestVersion), "%s", latest.c_str());
   updateChecked = true;
   updateAvailable = (latest.length() > 0 && latest != String(FW_VERSION));
-  Serial.printf("[OTA] check: running=%s latest=%s avail=%d\n", FW_VERSION, latestVersion, updateAvailable);
+  Serial.printf("[OTA] check: running=%s latest=%s (%s) avail=%d\n", FW_VERSION, latestVersion, lastCheckMsg, updateAvailable);
   server.sendHeader("Location", "/");
   server.send(303);   // back to dashboard
 }
