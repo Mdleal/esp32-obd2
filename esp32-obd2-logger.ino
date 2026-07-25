@@ -6,8 +6,8 @@
  * What it does:
  *   - Reads OBD2 PIDs from a Bluetooth-Classic ELM327 dongle (Veepeak).
  *   - Reads GPS (ATGM336H / NEO-6M) for accurate UTC time + location.
- *   - Every LOG_INTERVAL it snapshots the data into InfluxDB line-protocol
- *     lines with a real timestamp.
+ *   - Every LOG_INTERVAL it snapshots OBD + GPS + ESP-health into InfluxDB
+ *     line-protocol lines with a real timestamp.
  *   - If WiFi + InfluxDB are reachable, the buffer is flushed to the server.
  *   - If offline, lines accumulate on the microSD card and are uploaded
  *     automatically once WiFi returns -- so no data is lost in dead zones.
@@ -109,6 +109,11 @@ const float KMH_TO_MPH = 0.621371f;
 // InfluxDB upload health (shown on status page)
 int lastInfluxCode = 0;              // 0 = no upload attempted yet; 200/204 = ok; else error
 unsigned long lastInfluxMs = 0;     // millis() of last upload attempt
+
+// System / loop metrics
+uint32_t loopCount = 0;             // counts loop() iterations within the current second
+uint32_t loopRate = 0;             // loops/sec (proxy for CPU headroom)
+unsigned long lastRateMs = 0, lastSdRetryMs = 0;
 
 // ---------------- Config load/save ----------------
 void loadConfig() {
@@ -335,6 +340,20 @@ void logSnapshot() {
     addF(gl,"alt_m",(float)g_alt,gf); addF(gl,"speed_mph",(float)g_spdMph,gf);
     if (!gf) { gl += " "; gl += ns2str(ns); gl += "\n"; line += gl; }
   }
+
+  // measurement: system (ESP health -> graph memory/CPU in Grafana)
+  {
+    String sys = "system,vehicle="; sys += vehicleId; sys += " ";
+    sys += "heap_free=" + String(ESP.getFreeHeap());
+    sys += ",heap_min=" + String(ESP.getMinFreeHeap());
+    sys += ",heap_largest=" + String(ESP.getMaxAllocHeap());
+    sys += ",psram_free=" + String(ESP.getFreePsram());
+    sys += ",loop_rate=" + String(loopRate);
+    sys += ",chip_temp=" + String(temperatureRead(), 1);
+    sys += ",uptime_s=" + String(millis() / 1000);
+    sys += " "; sys += ns2str(ns); sys += "\n";
+    line += sys;
+  }
   if (line.length() == 0) return;
 
   if (sdOk) {
@@ -410,23 +429,59 @@ size_t bufBytes() {
   if (sdOk && SD.exists(UP))  { File f=SD.open(UP,FILE_READ);  if(f){n+=f.size();f.close();} }
   return n;
 }
+String sensorRow(const char* n, float v, const char* u) {
+  String r = "<tr><td>"; r += n; r += "</td><td align=right>";
+  r += isnan(v) ? String("n/a") : String(v, 2);
+  r += "</td><td>"; r += u; r += "</td></tr>";
+  return r;
+}
 void handleRoot() {
-  String h = "<html><body><h2>ESP32 OBD2 Logger</h2>";
-  h += "<p>OBD link: " + String(elmReady&&btConnected?"connected":"DISCONNECTED") + "</p>";
-  h += "<p>GPS sats: " + String(g_sats) + " | fix: " + String(!isnan(g_lat)?"yes":"no") + "</p>";
-  h += "<p>WiFi: " + String(WiFi.status()==WL_CONNECTED?WiFi.localIP().toString():"down") + "</p>";
-  h += "<p>SD: " + String(sdOk?"ok":"FAIL") + " | buffered: " + String(bufBytes()) + " bytes</p>";
+  String h = "<html><head><meta http-equiv='refresh' content='5'>";
+  h += "<style>body{font-family:sans-serif}table{border-collapse:collapse}td{border:1px solid #ccc;padding:2px 8px}</style></head><body>";
+  h += "<h2>ESP32 OBD2 Logger</h2>";
+  h += "<p><b>OBD link:</b> " + String(elmReady&&btConnected?"connected":"DISCONNECTED");
+  h += " &nbsp; <b>GPS:</b> " + String(g_sats) + " sats, fix " + String(!isnan(g_lat)?"yes":"no");
+  h += " &nbsp; <b>WiFi:</b> " + String(WiFi.status()==WL_CONNECTED?WiFi.localIP().toString():"down") + "</p>";
+  h += "<p><b>SD:</b> " + String(sdOk?"ok":"FAIL (check card / FAT32 / seating)") + " &nbsp; buffered: " + String(bufBytes()) + " bytes</p>";
   String ist;
   if (lastInfluxCode == 0)                          ist = "no upload yet";
   else if (lastInfluxCode == 200 || lastInfluxCode == 204) ist = "CONNECTED (last OK " + String((millis()-lastInfluxMs)/1000) + "s ago)";
   else                                              ist = "ERROR (HTTP " + String(lastInfluxCode) + ")";
-  h += "<p>InfluxDB: " + String(influxHost) + ":" + String(influxPort) + " / " + String(influxBucket) + " &mdash; " + ist + "</p>";
-  h += "<p>Latest: RPM " + String(v_rpm,0) + ", " + String(v_speedMph,1) + " mph, coolant " + String(v_coolant,0) + "C</p>";
+  h += "<p><b>InfluxDB:</b> " + String(influxHost) + ":" + String(influxPort) + " / " + String(influxBucket) + " &mdash; " + ist + "</p>";
   String faults;
   if (isnan(v_mil)) faults = "not read yet";
   else faults = String(v_mil>0.5?"MIL ON":"MIL off") + ", " + String((int)v_dtcCount) + " code(s)" + (v_misfire>0.5 ? ", MISFIRE code present" : "");
-  h += "<p>Faults: " + faults + "</p>";
-  h += "<p><a href='/config'>/config</a> (edit InfluxDB) &middot; <a href='/update'>/update</a> (OTA)</p></body></html>";
+  h += "<p><b>Faults:</b> " + faults + "</p>";
+
+  h += "<h3>Sensors</h3><table>";
+  h += sensorRow("Engine RPM", v_rpm, "rpm");
+  h += sensorRow("Vehicle speed", v_speedMph, "mph");
+  h += sensorRow("Coolant temp", v_coolant, "C");
+  h += sensorRow("Engine load", v_load, "%");
+  h += sensorRow("Throttle", v_throttle, "%");
+  h += sensorRow("Intake air temp", v_intake, "C");
+  h += sensorRow("MAF rate", v_maf, "g/s");
+  h += sensorRow("Battery (ATRV)", v_vbat, "V");
+  h += sensorRow("Fuel level", v_fuel, "%");
+  h += sensorRow("Short-term fuel trim B1", v_stft, "%");
+  h += sensorRow("Long-term fuel trim B1", v_ltft, "%");
+  h += sensorRow("Timing advance", v_timing, "deg");
+  h += sensorRow("Manifold pressure", v_map, "kPa");
+  h += sensorRow("Module voltage", v_modV, "V");
+  h += sensorRow("Runtime", v_runtime, "s");
+  h += sensorRow("Ambient temp", v_ambient, "C");
+  h += sensorRow("Oil temp", v_oil, "C");
+  h += "</table>";
+
+  h += "<h3>System</h3><ul>";
+  h += "<li>Uptime: " + String(millis()/1000) + " s</li>";
+  h += "<li>Free heap: " + String(ESP.getFreeHeap()) + " B (min " + String(ESP.getMinFreeHeap()) + ", largest block " + String(ESP.getMaxAllocHeap()) + ", total " + String(ESP.getHeapSize()) + ")</li>";
+  h += "<li>PSRAM: free " + String(ESP.getFreePsram()) + " / " + String(ESP.getPsramSize()) + " B</li>";
+  h += "<li>CPU: " + String(ESP.getCpuFreqMHz()) + " MHz &nbsp; loop rate " + String(loopRate) + "/s</li>";
+  h += "<li>Chip temp: " + String(temperatureRead(), 1) + " C (rough)</li>";
+  h += "</ul>";
+
+  h += "<p><a href='/config'>/config</a> (edit settings) &middot; <a href='/update'>/update</a> (OTA)</p></body></html>";
   server.send(200, "text/html", h);
 }
 
@@ -499,6 +554,15 @@ void loop() {
   server.handleClient();
   ElegantOTA.loop();
   feedGPS();
+
+  // Loop-rate counter (CPU-headroom proxy) + SD auto-retry if it failed to mount
+  loopCount++;
+  if (millis() - lastRateMs >= 1000) { loopRate = loopCount; loopCount = 0; lastRateMs = millis(); }
+  if (!sdOk && millis() - lastSdRetryMs > 10000) {
+    lastSdRetryMs = millis();
+    sdOk = SD.begin(SD_CS);
+    if (sdOk) Serial.println("SD card mounted (retry).");
+  }
 
   // Keep OBD alive
   if (!btConnected || !elmReady) {
