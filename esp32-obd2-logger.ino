@@ -4,8 +4,8 @@
  * Board:  LoLin D32 Pro (ESP32-WROVER, classic ESP32 -> Bluetooth Classic OK)
  *
  * Features: OBD2 over BT-Classic ELM327, GPS time+location, SD store-and-forward
- * to InfluxDB, misfire/DTC detection, live dashboard, and manual OTA self-update
- * (Check-for-update / Update-now buttons that pull firmware from raw.githubusercontent).
+ * to InfluxDB, misfire/DTC detection, live dashboard, static IP option,
+ * GitHub OTA self-update (Check/Update buttons) + manual firmware upload page.
  *
  * First-boot config: captive-portal AP "ESP32-LOGGER" (pw: loggersetup).
  * After it is on WiFi, settings can be edited any time at http://<board-ip>/config
@@ -17,7 +17,7 @@
  *   NOTE: GPIO16/17 are used by PSRAM on WROVER -- do NOT use them for GPS.
  *
  * Build: generic esp32 (WROVER), FQBN esp32:esp32:esp32:PSRAM=enabled,PartitionScheme=min_spiffs
- * Libraries: ELMduino, WiFiManager, TinyGPSPlus (+ core SD/HTTPClient/HTTPUpdate)
+ * Libraries: ELMduino, WiFiManager, TinyGPSPlus (+ core SD/HTTPClient/HTTPUpdate/Update)
  */
 
 #include <WiFi.h>
@@ -33,6 +33,7 @@
 #include <WiFiManager.h>
 #include <TinyGPSPlus.h>
 #include <HTTPUpdate.h>
+#include <Update.h>
 #include <time.h>
 #include <sys/time.h>
 #include "esp_system.h"
@@ -65,6 +66,10 @@ char influxToken[192]= "";
 char btMac[20]       = "00:1D:A5:07:5D:3C";
 char btPin[8]        = "1234";
 char vehicleId[24]   = "mycar";
+char staticIP[16]    = "";         // blank = DHCP
+char staticGW[16]    = "";
+char staticSN[16]    = "255.255.255.0";
+char staticDNS[16]   = "";
 bool shouldSaveConfig = false;
 
 // ---------------- Globals ----------------
@@ -129,6 +134,10 @@ void loadConfig() {
   prefs.getString("btMac",  btMac,       sizeof(btMac));
   prefs.getString("btPin",  btPin,       sizeof(btPin));
   prefs.getString("veh",    vehicleId,   sizeof(vehicleId));
+  prefs.getString("sIP",    staticIP,    sizeof(staticIP));
+  prefs.getString("sGW",    staticGW,    sizeof(staticGW));
+  prefs.getString("sSN",    staticSN,    sizeof(staticSN));
+  prefs.getString("sDNS",   staticDNS,   sizeof(staticDNS));
   prefs.end();
 }
 void saveConfig() {
@@ -141,6 +150,10 @@ void saveConfig() {
   prefs.putString("btMac",  btMac);
   prefs.putString("btPin",  btPin);
   prefs.putString("veh",    vehicleId);
+  prefs.putString("sIP",    staticIP);
+  prefs.putString("sGW",    staticGW);
+  prefs.putString("sSN",    staticSN);
+  prefs.putString("sDNS",   staticDNS);
   prefs.end();
 }
 void saveConfigCallback() { shouldSaveConfig = true; }
@@ -163,9 +176,25 @@ void setupWiFi() {
   WiFiManagerParameter p_mac  ("mac",    "OBD2 Bluetooth MAC",btMac,       sizeof(btMac));
   WiFiManagerParameter p_pin  ("pin",    "OBD2 Bluetooth PIN",btPin,       sizeof(btPin));
   WiFiManagerParameter p_veh  ("veh",    "Vehicle name/tag",  vehicleId,   sizeof(vehicleId));
+  WiFiManagerParameter p_sip  ("sip",    "Static IP (blank = DHCP)", staticIP,  sizeof(staticIP));
+  WiFiManagerParameter p_sgw  ("sgw",    "Gateway",           staticGW,  sizeof(staticGW));
+  WiFiManagerParameter p_ssn  ("ssn",    "Subnet mask",       staticSN,  sizeof(staticSN));
+  WiFiManagerParameter p_sdns ("sdns",   "DNS server",        staticDNS, sizeof(staticDNS));
   wm.addParameter(&p_host); wm.addParameter(&p_port); wm.addParameter(&p_org);
   wm.addParameter(&p_bkt);  wm.addParameter(&p_tok);  wm.addParameter(&p_mac);
   wm.addParameter(&p_pin);  wm.addParameter(&p_veh);
+  wm.addParameter(&p_sip);  wm.addParameter(&p_sgw);  wm.addParameter(&p_ssn); wm.addParameter(&p_sdns);
+
+  // Apply static IP if configured (must be before connecting)
+  if (strlen(staticIP) > 0) {
+    IPAddress ip, gw, sn, dns;
+    ip.fromString(staticIP);
+    gw.fromString(strlen(staticGW) ? staticGW : "0.0.0.0");
+    sn.fromString(strlen(staticSN) ? staticSN : "255.255.255.0");
+    dns.fromString(strlen(staticDNS) ? staticDNS : (strlen(staticGW) ? staticGW : "8.8.8.8"));
+    wm.setSTAStaticIPConfig(ip, gw, sn, dns);
+    Serial.printf("Static IP configured: %s\n", staticIP);
+  }
 
   wm.setConfigPortalTimeout(0);  // stay until configured
   Serial.println("autoConnect('ESP32-LOGGER')...");
@@ -181,6 +210,10 @@ void setupWiFi() {
     strncpy(btMac,       p_mac.getValue(),  sizeof(btMac));
     strncpy(btPin,       p_pin.getValue(),  sizeof(btPin));
     strncpy(vehicleId,   p_veh.getValue(),  sizeof(vehicleId));
+    strncpy(staticIP,    p_sip.getValue(),  sizeof(staticIP));
+    strncpy(staticGW,    p_sgw.getValue(),  sizeof(staticGW));
+    strncpy(staticSN,    p_ssn.getValue(),  sizeof(staticSN));
+    strncpy(staticDNS,   p_sdns.getValue(), sizeof(staticDNS));
     saveConfig();
     Serial.println("Config saved.");
   }
@@ -497,7 +530,7 @@ void handleRoot() {
     }
   }
 
-  h += "<p><a href='/config'>/config</a> (edit settings)</p></body></html>";
+  h += "<p><a href='/config'>/config</a> (edit settings) &middot; <a href='/manualupdate'>manual firmware upload</a></p></body></html>";
   server.send(200, "text/html", h);
 }
 
@@ -513,7 +546,13 @@ void handleConfig() {
   h += "Vehicle tag: <input name='veh' value='" + String(vehicleId) + "'><br><br>";
   h += "OBD2 Bluetooth MAC: <input name='mac' value='" + String(btMac) + "'><br><br>";
   h += "OBD2 Bluetooth PIN: <input name='pin' value='" + String(btPin) + "'><br><br>";
+  h += "<hr>Static IP (blank = DHCP): <input name='sip' value='" + String(staticIP) + "'><br><br>";
+  h += "Gateway: <input name='sgw' value='" + String(staticGW) + "'><br><br>";
+  h += "Subnet mask: <input name='ssn' value='" + String(staticSN) + "'><br><br>";
+  h += "DNS server: <input name='sdns' value='" + String(staticDNS) + "'><br><br>";
   h += "<input type='submit' value='Save'></form>";
+  h += "<p><i>Static IP changes take effect after a reboot.</i></p>";
+  h += "<form method='POST' action='/reboot'><button>Reboot now</button></form>";
   h += "<p><a href='/'>&larr; status</a></p></body></html>";
   server.send(200, "text/html", h);
 }
@@ -527,10 +566,15 @@ void handleSave() {
   if (server.hasArg("veh"))    snprintf(vehicleId,    sizeof(vehicleId),    "%s", server.arg("veh").c_str());
   if (server.hasArg("mac"))    snprintf(btMac,        sizeof(btMac),        "%s", server.arg("mac").c_str());
   if (server.hasArg("pin"))    snprintf(btPin,        sizeof(btPin),        "%s", server.arg("pin").c_str());
+  if (server.hasArg("sip"))    snprintf(staticIP,     sizeof(staticIP),     "%s", server.arg("sip").c_str());
+  if (server.hasArg("sgw"))    snprintf(staticGW,     sizeof(staticGW),     "%s", server.arg("sgw").c_str());
+  if (server.hasArg("ssn"))    snprintf(staticSN,     sizeof(staticSN),     "%s", server.arg("ssn").c_str());
+  if (server.hasArg("sdns"))   snprintf(staticDNS,    sizeof(staticDNS),    "%s", server.arg("sdns").c_str());
   saveConfig();
   Serial.println("Config updated via web page.");
   String h = "<html><body><h2>Saved.</h2>";
-  h += "<p>Now sending to: " + String(influxHost) + ":" + String(influxPort) + " / bucket " + String(influxBucket) + "</p>";
+  h += "<p>Sending to: " + String(influxHost) + ":" + String(influxPort) + " / bucket " + String(influxBucket) + "</p>";
+  h += "<p>Static IP: " + String(strlen(staticIP)?staticIP:"DHCP") + " (reboot to apply)</p>";
   h += "<p><a href='/config'>&larr; edit again</a> &middot; <a href='/'>status</a></p></body></html>";
   server.send(200, "text/html", h);
 }
@@ -575,6 +619,41 @@ void handleDoUpdate() {
   }
 }
 
+// ---------------- Manual firmware upload (browser fallback OTA) ----------------
+void handleManualPage() {
+  String h = "<html><body><h2>Manual firmware upload</h2>";
+  h += "<p>Upload <b>logger-app-ota.bin</b> (the app image -- NOT logger-firmware.bin).</p>";
+  h += "<form method='POST' action='/doupload' enctype='multipart/form-data'>";
+  h += "<input type='file' name='f' accept='.bin'> <input type='submit' value='Upload &amp; Flash'></form>";
+  h += "<p><a href='/'>&larr; status</a></p></body></html>";
+  server.send(200, "text/html", h);
+}
+void handleUploadDone() {
+  bool ok = !Update.hasError();
+  server.send(200, "text/html", ok
+    ? "<html><body><h3>Flashed OK -- rebooting...</h3><p>Reload <a href='/'>status</a> in ~10s.</p></body></html>"
+    : "<html><body><h3>Upload FAILED</h3><p><a href='/manualupdate'>try again</a></p></body></html>");
+  delay(400);
+  if (ok) ESP.restart(); else connectOBD();
+}
+void handleUpload() {
+  HTTPUpload& u = server.upload();
+  if (u.status == UPLOAD_FILE_START) {
+    Serial.printf("[OTA] Manual upload: %s\n", u.filename.c_str());
+    SerialBT.end(); btConnected=false; elmReady=false;   // free RAM for the write
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+  } else if (u.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
+  } else if (u.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) Serial.printf("[OTA] Manual OK: %u bytes\n", u.totalSize);
+    else Update.printError(Serial);
+  }
+}
+void handleReboot() {
+  server.send(200, "text/html", "<html><body><h3>Rebooting...</h3><p>Reload <a href='/'>status</a> in ~10s.</p></body></html>");
+  delay(400); ESP.restart();
+}
+
 // ---------------- Setup / loop ----------------
 void setup() {
   Serial.begin(115200);
@@ -601,8 +680,11 @@ void setup() {
   server.on("/save", HTTP_POST, handleSave);
   server.on("/checkupdate", HTTP_POST, handleCheckUpdate);
   server.on("/doupdate", HTTP_POST, handleDoUpdate);
+  server.on("/manualupdate", HTTP_GET, handleManualPage);
+  server.on("/doupload", HTTP_POST, handleUploadDone, handleUpload);
+  server.on("/reboot", HTTP_POST, handleReboot);
   server.begin();
-  Serial.println("HTTP server up (/, /config, /checkupdate).");
+  Serial.println("HTTP server up (/, /config, /checkupdate, /manualupdate).");
 
   connectOBD();
 }
