@@ -3,9 +3,10 @@
  * ------------------------------------------------------------------
  * Board:  LoLin D32 Pro (ESP32-WROVER, classic ESP32 -> Bluetooth Classic OK)
  *
- * Features: OBD2 over BT-Classic ELM327, GPS time+location, SD store-and-forward
- * to InfluxDB, MQTT publishing with Home Assistant auto-discovery, misfire/DTC
- * detection, live dashboard, static IP, GitHub OTA + manual firmware upload.
+ * Features: OBD2 over BT-Classic ELM327, GPS time+location (HA map via
+ * device_tracker), SD store-and-forward to InfluxDB, MQTT publishing with HA
+ * auto-discovery, misfire/DTC detection, live dashboard, static IP,
+ * GitHub OTA + manual firmware upload. Version = bN-<sha> (build number).
  *
  * First-boot config: captive-portal AP "ESP32-LOGGER" (pw: loggersetup).
  * After it is on WiFi, settings can be edited any time at http://<board-ip>/config
@@ -39,7 +40,6 @@
 #include <sys/time.h>
 #include "esp_system.h"
 
-// Firmware version (commit SHA) is injected by the CI build via version.h.
 #if __has_include("version.h")
 #include "version.h"
 #endif
@@ -64,7 +64,7 @@ char influxPort[6]   = "443";
 char influxOrg[48]   = "";
 char influxBucket[48]= "";
 char influxToken[192]= "";
-char mqttHost[64]    = "";      // blank = MQTT disabled
+char mqttHost[64]    = "";
 char mqttPort[6]     = "1883";
 char mqttUser[32]    = "";
 char mqttPass[64]    = "";
@@ -89,7 +89,6 @@ PubSubClient mqtt(mqttNet);
 bool btConnected = false;
 bool elmReady    = false;
 
-// Latest OBD values (NAN = unknown / unsupported)
 float v_rpm=NAN, v_speedMph=NAN, v_coolant=NAN, v_load=NAN, v_throttle=NAN,
       v_intake=NAN, v_maf=NAN, v_vbat=NAN, v_fuel=NAN;
 float v_stft=NAN, v_ltft=NAN, v_timing=NAN, v_map=NAN, v_modV=NAN,
@@ -100,10 +99,8 @@ const uint8_t PID_COUNT = 18;
 unsigned long lastDtcMs = 0;
 const unsigned long DTC_INTERVAL = 60000;
 
-// GPS latest
 double g_lat=NAN, g_lon=NAN, g_alt=NAN, g_spdMph=NAN; uint32_t g_sats=0;
 
-// Buffering
 const char* BUF = "/buffer.lp";
 const char* UP  = "/uploading.lp";
 bool sdOk = false;
@@ -121,7 +118,6 @@ uint32_t loopCount = 0;
 uint32_t loopRate = 0;
 unsigned long lastRateMs = 0, lastSdRetryMs = 0;
 
-// OTA self-update (served from raw.githubusercontent -- direct, no redirect)
 const char* VERSION_URL = "https://raw.githubusercontent.com/Mdleal/esp32-obd2/logger/firmware/version.txt";
 const char* BIN_URL     = "https://raw.githubusercontent.com/Mdleal/esp32-obd2/logger/firmware/logger-app-ota.bin";
 bool updateChecked  = false;
@@ -481,6 +477,7 @@ MField mf[] = {
   {"misfire",     "Misfire",            "",    "",            &v_misfire},
 };
 const int MF_COUNT = sizeof(mf) / sizeof(mf[0]);
+const char* DEVJSON = "\"dev\":{\"ids\":[\"esp32logger\"],\"name\":\"ESP32 OBD2 Logger\",\"mf\":\"DIY\",\"mdl\":\"LoLin D32 Pro\"}";
 
 void sendDiscovery() {
   for (int i = 0; i < MF_COUNT; i++) {
@@ -493,7 +490,17 @@ void sendDiscovery() {
     if (strlen(mf[i].unit) > 0) p += "\"unit_of_meas\":\"" + String(mf[i].unit) + "\",";
     if (strlen(mf[i].dev) > 0)  p += "\"dev_cla\":\"" + String(mf[i].dev) + "\",";
     p += "\"stat_cla\":\"measurement\",";
-    p += "\"dev\":{\"ids\":[\"esp32logger\"],\"name\":\"ESP32 OBD2 Logger\",\"mf\":\"DIY\",\"mdl\":\"LoLin D32 Pro\"}";
+    p += DEVJSON;
+    p += "}";
+    mqtt.publish(t.c_str(), p.c_str(), true);
+  }
+  // GPS as a device_tracker -> shows the car on the HA map
+  {
+    String t = "homeassistant/device_tracker/esp32logger/car/config";
+    String p = "{\"name\":\"Car\",\"uniq_id\":\"esp32logger_car\",";
+    p += "\"json_attr_t\":\"esp32logger/gps_attr\",\"source_type\":\"gps\",";
+    p += "\"avty_t\":\"esp32logger/status\",";
+    p += DEVJSON;
     p += "}";
     mqtt.publish(t.c_str(), p.c_str(), true);
   }
@@ -518,6 +525,13 @@ void publishMqtt() {
     if (isnan(*mf[i].val)) continue;
     String tp = "esp32logger/" + String(mf[i].key);
     mqtt.publish(tp.c_str(), String(*mf[i].val, 2).c_str(), true);
+  }
+  if (!isnan(g_lat) && !isnan(g_lon)) {
+    String a = "{\"latitude\":" + String(g_lat, 6) + ",\"longitude\":" + String(g_lon, 6);
+    if (!isnan(g_alt))    a += ",\"altitude\":" + String(g_alt, 1);
+    if (!isnan(g_spdMph)) a += ",\"gps_speed_mph\":" + String(g_spdMph, 1);
+    a += ",\"gps_accuracy\":10,\"satellites\":" + String(g_sats) + "}";
+    mqtt.publish("esp32logger/gps_attr", a.c_str(), true);
   }
 }
 
@@ -571,6 +585,8 @@ void handleRoot() {
   h += sensorRow("Runtime", v_runtime, "s");
   h += sensorRow("Ambient temp", v_ambient, "C");
   h += sensorRow("Oil temp", v_oil, "C");
+  h += sensorRow("GPS latitude", (float)g_lat, "deg");
+  h += sensorRow("GPS longitude", (float)g_lon, "deg");
   h += "</table>";
 
   h += "<h3>System</h3><ul>";
@@ -582,12 +598,12 @@ void handleRoot() {
   h += "</ul>";
 
   h += "<h3>Firmware</h3>";
-  h += "<p>Running: " + String(FW_VERSION).substring(0, 12) + "</p>";
+  h += "<p>Running: <b>" + String(FW_VERSION) + "</b></p>";
   h += "<form method='POST' action='/checkupdate' style='display:inline'><button>Check for update</button></form>";
   if (updateChecked) {
     h += " &mdash; last check: " + String(lastCheckMsg);
     if (updateAvailable) {
-      h += " &mdash; <b>Update available:</b> " + String(latestVersion).substring(0, 12);
+      h += " &mdash; <b>Update available:</b> " + String(latestVersion);
       h += " <form method='POST' action='/doupdate' style='display:inline'><button>Update now</button></form>";
     } else if (strlen(latestVersion) > 0) {
       h += " (up to date)";
@@ -780,7 +796,6 @@ void loop() {
   if (millis() - lastLogMs > LOG_INTERVAL) { lastLogMs = millis(); logSnapshot(); }
   if (millis() - lastUploadMs > UPLOAD_INTERVAL) { lastUploadMs = millis(); flushBuffer(); }
 
-  // MQTT -> Home Assistant
   if (strlen(mqttHost) > 0 && WiFi.status() == WL_CONNECTED) {
     if (!mqtt.connected()) mqttReconnect();
     mqtt.loop();

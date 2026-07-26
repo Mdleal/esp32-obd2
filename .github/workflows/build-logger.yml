@@ -3,7 +3,7 @@ name: Build logger firmware
 on:
   push:
     branches: [logger]
-    paths-ignore: ['firmware/**']   # don't re-trigger on the CI firmware commit
+    paths-ignore: ['firmware/**']
   workflow_dispatch:
 
 permissions:
@@ -38,7 +38,11 @@ jobs:
         run: |
           mkdir -p sketch/esp32-obd2-logger
           cp esp32-obd2-logger.ino sketch/esp32-obd2-logger/esp32-obd2-logger.ino
-          echo "#define FW_VERSION \"${GITHUB_SHA}\"" > sketch/esp32-obd2-logger/version.h
+          SHORT="${GITHUB_SHA:0:7}"
+          VER="b${GITHUB_RUN_NUMBER}-${SHORT}"
+          echo "FW_VER=${VER}" >> "$GITHUB_ENV"
+          echo "#define FW_VERSION \"${VER}\"" > sketch/esp32-obd2-logger/version.h
+          echo "Building ${VER}"
           arduino-cli compile \
             --fqbn esp32:esp32:esp32:PSRAM=enabled,PartitionScheme=min_spiffs \
             --export-binaries \
@@ -72,9 +76,9 @@ jobs:
         run: |
           mkdir -p firmware
           cp out/logger-app-ota.bin firmware/logger-app-ota.bin
-          echo -n "${GITHUB_SHA}" > firmware/version.txt
+          echo -n "${FW_VER}" > firmware/version.txt
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add firmware/logger-app-ota.bin firmware/version.txt
-          git commit -m "CI: firmware ${GITHUB_SHA}" || echo "no changes"
+          git commit -m "CI: ${FW_VER}" || echo "no changes"
           git push origin HEAD:logger
