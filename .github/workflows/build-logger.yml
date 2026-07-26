@@ -32,6 +32,7 @@ jobs:
           arduino-cli lib install "ELMduino"
           arduino-cli lib install "WiFiManager"
           arduino-cli lib install "TinyGPSPlus"
+          arduino-cli lib install "PubSubClient"
 
       - name: Assemble sketch folder and compile
         run: |

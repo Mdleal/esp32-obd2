@@ -1,11 +1,11 @@
 /*
- * ESP32 OBD2 Logger  ->  InfluxDB (with SD store-and-forward + GPS)
+ * ESP32 OBD2 Logger  ->  InfluxDB + Home Assistant (MQTT)
  * ------------------------------------------------------------------
  * Board:  LoLin D32 Pro (ESP32-WROVER, classic ESP32 -> Bluetooth Classic OK)
  *
  * Features: OBD2 over BT-Classic ELM327, GPS time+location, SD store-and-forward
- * to InfluxDB, misfire/DTC detection, live dashboard, static IP option,
- * GitHub OTA self-update (Check/Update buttons) + manual firmware upload page.
+ * to InfluxDB, MQTT publishing with Home Assistant auto-discovery, misfire/DTC
+ * detection, live dashboard, static IP, GitHub OTA + manual firmware upload.
  *
  * First-boot config: captive-portal AP "ESP32-LOGGER" (pw: loggersetup).
  * After it is on WiFi, settings can be edited any time at http://<board-ip>/config
@@ -17,7 +17,7 @@
  *   NOTE: GPIO16/17 are used by PSRAM on WROVER -- do NOT use them for GPS.
  *
  * Build: generic esp32 (WROVER), FQBN esp32:esp32:esp32:PSRAM=enabled,PartitionScheme=min_spiffs
- * Libraries: ELMduino, WiFiManager, TinyGPSPlus (+ core SD/HTTPClient/HTTPUpdate/Update)
+ * Libraries: ELMduino, WiFiManager, TinyGPSPlus, PubSubClient (+ core SD/HTTPClient/HTTPUpdate/Update)
  */
 
 #include <WiFi.h>
@@ -32,6 +32,7 @@
 #include "ELMduino.h"
 #include <WiFiManager.h>
 #include <TinyGPSPlus.h>
+#include <PubSubClient.h>
 #include <HTTPUpdate.h>
 #include <Update.h>
 #include <time.h>
@@ -52,21 +53,25 @@
 
 // ---------------- Pins ----------------
 #define SD_CS       4
-#define GPS_RX_PIN  25   // ESP RX  <- GPS TX
-#define GPS_TX_PIN  26   // ESP TX  -> GPS RX
+#define GPS_RX_PIN  25
+#define GPS_TX_PIN  26
 #define GPS_BAUD    9600
 
 // ---------------- Config (persisted) ----------------
 Preferences prefs;
 char influxHost[64]  = "";
-char influxPort[6]   = "443";      // 443 = HTTPS (domain behind reverse proxy)
+char influxPort[6]   = "443";
 char influxOrg[48]   = "";
 char influxBucket[48]= "";
 char influxToken[192]= "";
+char mqttHost[64]    = "";      // blank = MQTT disabled
+char mqttPort[6]     = "1883";
+char mqttUser[32]    = "";
+char mqttPass[64]    = "";
 char btMac[20]       = "00:1D:A5:07:5D:3C";
 char btPin[8]        = "1234";
 char vehicleId[24]   = "mycar";
-char staticIP[16]    = "";         // blank = DHCP
+char staticIP[16]    = "";
 char staticGW[16]    = "";
 char staticSN[16]    = "255.255.255.0";
 char staticDNS[16]   = "";
@@ -78,20 +83,22 @@ ELM327 elm;
 WebServer server(80);
 TinyGPSPlus gps;
 HardwareSerial GPSserial(2);
+WiFiClient mqttNet;
+PubSubClient mqtt(mqttNet);
 
 bool btConnected = false;
 bool elmReady    = false;
 
-// Latest OBD values (NAN = unknown / unsupported by this car -> skipped in output)
+// Latest OBD values (NAN = unknown / unsupported)
 float v_rpm=NAN, v_speedMph=NAN, v_coolant=NAN, v_load=NAN, v_throttle=NAN,
       v_intake=NAN, v_maf=NAN, v_vbat=NAN, v_fuel=NAN;
 float v_stft=NAN, v_ltft=NAN, v_timing=NAN, v_map=NAN, v_modV=NAN,
       v_runtime=NAN, v_ambient=NAN, v_oil=NAN;
 float v_mil=NAN, v_dtcCount=NAN, v_misfire=NAN;
 uint8_t pidState = 0;
-const uint8_t PID_COUNT = 18;   // round-robin length (indices 0..17)
+const uint8_t PID_COUNT = 18;
 unsigned long lastDtcMs = 0;
-const unsigned long DTC_INTERVAL = 60000;   // check trouble codes every 60s
+const unsigned long DTC_INTERVAL = 60000;
 
 // GPS latest
 double g_lat=NAN, g_lon=NAN, g_alt=NAN, g_spdMph=NAN; uint32_t g_sats=0;
@@ -101,27 +108,26 @@ const char* BUF = "/buffer.lp";
 const char* UP  = "/uploading.lp";
 bool sdOk = false;
 
-unsigned long lastLogMs = 0, lastUploadMs = 0, lastBeatMs = 0, lastConnTryMs = 0;
-const unsigned long LOG_INTERVAL    = 2000;   // snapshot every 2s
-const unsigned long UPLOAD_INTERVAL = 15000;  // try to flush every 15s
+unsigned long lastLogMs = 0, lastUploadMs = 0, lastBeatMs = 0, lastConnTryMs = 0, lastMqttMs = 0;
+const unsigned long LOG_INTERVAL    = 2000;
+const unsigned long UPLOAD_INTERVAL = 15000;
+const unsigned long MQTT_PUB_INTERVAL = 5000;
 const float KMH_TO_MPH = 0.621371f;
 
-// InfluxDB upload health (shown on status page)
-int lastInfluxCode = 0;              // 0 = no upload attempted yet; 200/204 = ok; else error
-unsigned long lastInfluxMs = 0;     // millis() of last upload attempt
+int lastInfluxCode = 0;
+unsigned long lastInfluxMs = 0;
 
-// System / loop metrics
-uint32_t loopCount = 0;             // counts loop() iterations within the current second
-uint32_t loopRate = 0;             // loops/sec (proxy for CPU headroom)
+uint32_t loopCount = 0;
+uint32_t loopRate = 0;
 unsigned long lastRateMs = 0, lastSdRetryMs = 0;
 
-// OTA self-update (manual). Served from raw.githubusercontent (direct, no redirect).
+// OTA self-update (served from raw.githubusercontent -- direct, no redirect)
 const char* VERSION_URL = "https://raw.githubusercontent.com/Mdleal/esp32-obd2/logger/firmware/version.txt";
 const char* BIN_URL     = "https://raw.githubusercontent.com/Mdleal/esp32-obd2/logger/firmware/logger-app-ota.bin";
-bool updateChecked  = false;       // has the user run a check this session?
-bool updateAvailable = false;      // latest != running
+bool updateChecked  = false;
+bool updateAvailable = false;
 char latestVersion[48] = "";
-char lastCheckMsg[64] = "";        // human-readable result of the last check
+char lastCheckMsg[64] = "";
 
 // ---------------- Config load/save ----------------
 void loadConfig() {
@@ -131,6 +137,10 @@ void loadConfig() {
   prefs.getString("iOrg",   influxOrg,   sizeof(influxOrg));
   prefs.getString("iBucket",influxBucket,sizeof(influxBucket));
   prefs.getString("iToken", influxToken, sizeof(influxToken));
+  prefs.getString("mHost",  mqttHost,    sizeof(mqttHost));
+  prefs.getString("mPort",  mqttPort,    sizeof(mqttPort));
+  prefs.getString("mUser",  mqttUser,    sizeof(mqttUser));
+  prefs.getString("mPass",  mqttPass,    sizeof(mqttPass));
   prefs.getString("btMac",  btMac,       sizeof(btMac));
   prefs.getString("btPin",  btPin,       sizeof(btPin));
   prefs.getString("veh",    vehicleId,   sizeof(vehicleId));
@@ -147,6 +157,10 @@ void saveConfig() {
   prefs.putString("iOrg",   influxOrg);
   prefs.putString("iBucket",influxBucket);
   prefs.putString("iToken", influxToken);
+  prefs.putString("mHost",  mqttHost);
+  prefs.putString("mPort",  mqttPort);
+  prefs.putString("mUser",  mqttUser);
+  prefs.putString("mPass",  mqttPass);
   prefs.putString("btMac",  btMac);
   prefs.putString("btPin",  btPin);
   prefs.putString("veh",    vehicleId);
@@ -173,6 +187,10 @@ void setupWiFi() {
   WiFiManagerParameter p_org  ("iorg",   "InfluxDB org",      influxOrg,   sizeof(influxOrg));
   WiFiManagerParameter p_bkt  ("ibkt",   "InfluxDB bucket",   influxBucket,sizeof(influxBucket));
   WiFiManagerParameter p_tok  ("itok",   "InfluxDB API token",influxToken, sizeof(influxToken));
+  WiFiManagerParameter p_mh   ("mh",     "MQTT host (blank=off)", mqttHost, sizeof(mqttHost));
+  WiFiManagerParameter p_mp   ("mp",     "MQTT port",         mqttPort,    sizeof(mqttPort));
+  WiFiManagerParameter p_mu   ("mu",     "MQTT user",         mqttUser,    sizeof(mqttUser));
+  WiFiManagerParameter p_mpw  ("mpw",    "MQTT password",     mqttPass,    sizeof(mqttPass));
   WiFiManagerParameter p_mac  ("mac",    "OBD2 Bluetooth MAC",btMac,       sizeof(btMac));
   WiFiManagerParameter p_pin  ("pin",    "OBD2 Bluetooth PIN",btPin,       sizeof(btPin));
   WiFiManagerParameter p_veh  ("veh",    "Vehicle name/tag",  vehicleId,   sizeof(vehicleId));
@@ -181,11 +199,11 @@ void setupWiFi() {
   WiFiManagerParameter p_ssn  ("ssn",    "Subnet mask",       staticSN,  sizeof(staticSN));
   WiFiManagerParameter p_sdns ("sdns",   "DNS server",        staticDNS, sizeof(staticDNS));
   wm.addParameter(&p_host); wm.addParameter(&p_port); wm.addParameter(&p_org);
-  wm.addParameter(&p_bkt);  wm.addParameter(&p_tok);  wm.addParameter(&p_mac);
-  wm.addParameter(&p_pin);  wm.addParameter(&p_veh);
+  wm.addParameter(&p_bkt);  wm.addParameter(&p_tok);
+  wm.addParameter(&p_mh);   wm.addParameter(&p_mp);   wm.addParameter(&p_mu); wm.addParameter(&p_mpw);
+  wm.addParameter(&p_mac);  wm.addParameter(&p_pin);  wm.addParameter(&p_veh);
   wm.addParameter(&p_sip);  wm.addParameter(&p_sgw);  wm.addParameter(&p_ssn); wm.addParameter(&p_sdns);
 
-  // Apply static IP if configured (must be before connecting)
   if (strlen(staticIP) > 0) {
     IPAddress ip, gw, sn, dns;
     ip.fromString(staticIP);
@@ -196,7 +214,7 @@ void setupWiFi() {
     Serial.printf("Static IP configured: %s\n", staticIP);
   }
 
-  wm.setConfigPortalTimeout(0);  // stay until configured
+  wm.setConfigPortalTimeout(0);
   Serial.println("autoConnect('ESP32-LOGGER')...");
   if (!wm.autoConnect("ESP32-LOGGER", "loggersetup")) {
     Serial.println("Portal timeout; rebooting."); delay(2000); ESP.restart();
@@ -207,6 +225,10 @@ void setupWiFi() {
     strncpy(influxOrg,   p_org.getValue(),  sizeof(influxOrg));
     strncpy(influxBucket,p_bkt.getValue(),  sizeof(influxBucket));
     strncpy(influxToken, p_tok.getValue(),  sizeof(influxToken));
+    strncpy(mqttHost,    p_mh.getValue(),   sizeof(mqttHost));
+    strncpy(mqttPort,    p_mp.getValue(),   sizeof(mqttPort));
+    strncpy(mqttUser,    p_mu.getValue(),   sizeof(mqttUser));
+    strncpy(mqttPass,    p_mpw.getValue(),  sizeof(mqttPass));
     strncpy(btMac,       p_mac.getValue(),  sizeof(btMac));
     strncpy(btPin,       p_pin.getValue(),  sizeof(btPin));
     strncpy(vehicleId,   p_veh.getValue(),  sizeof(vehicleId));
@@ -218,7 +240,7 @@ void setupWiFi() {
     Serial.println("Config saved.");
   }
   Serial.print("WiFi OK, IP: "); Serial.println(WiFi.localIP());
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");  // UTC via NTP when online
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 }
 
 // ---------------- Bluetooth / ELM327 ----------------
@@ -243,22 +265,17 @@ void connectOBD() {
 }
 void pollOBD() {
   if (!elmReady) return;
-
-  // Battery voltage (ATRV) -- blocking call, handle separately
   if (pidState == 7) { float bv=elm.batteryVoltage(); v_vbat=(bv>0)?bv:NAN; pidState=(pidState+1)%PID_COUNT; return; }
-
-  // Monitor status (PID 0x01): MIL on/off + stored DTC count
   if (pidState == 17) {
     uint32_t ms = elm.monitorStatus();
     if (elm.nb_rx_state == ELM_SUCCESS) {
-      uint8_t A = (ms >> 24) & 0xFF;   // byte A: bit7 = MIL, bits0-6 = DTC count
+      uint8_t A = (ms >> 24) & 0xFF;
       v_mil = (A & 0x80) ? 1 : 0;
       v_dtcCount = (float)(A & 0x7F);
     }
     if (elm.nb_rx_state != ELM_GETTING_MSG) pidState=(pidState+1)%PID_COUNT;
     return;
   }
-
   float val=NAN;
   switch (pidState) {
     case 0:  val=elm.rpm();                   break;
@@ -300,18 +317,16 @@ void pollOBD() {
     }
     resolved=true;
   } else if (elm.nb_rx_state != ELM_GETTING_MSG) {
-    resolved=true;   // error/unsupported -> keep old value, move on
+    resolved=true;
   }
   if (resolved) pidState=(pidState+1)%PID_COUNT;
 }
-
-// Read stored DTCs (Mode 03, blocking) and flag misfire codes (P0300-P030x)
 void checkDTCs() {
   elm.currentDTCCodes(true);
   int mis = 0;
   for (uint8_t i = 0; i < elm.DTC_Response.codesFound; i++) {
     Serial.printf("DTC: %s\n", elm.DTC_Response.codes[i]);
-    if (strncmp(elm.DTC_Response.codes[i], "P030", 4) == 0) mis = 1;   // P0300-P0309 misfire
+    if (strncmp(elm.DTC_Response.codes[i], "P030", 4) == 0) mis = 1;
   }
   v_misfire = mis;
 }
@@ -323,12 +338,11 @@ void feedGPS() {
   if (gps.altitude.isValid()) g_alt=gps.altitude.meters();
   if (gps.speed.isValid())    g_spdMph=gps.speed.mph();
   if (gps.satellites.isValid()) g_sats=gps.satellites.value();
-  // Set system clock from GPS (UTC) if we don't have valid time yet
   if (time(nullptr) < 1700000000 && gps.date.isValid() && gps.time.isValid() && gps.date.year() > 2020) {
     struct tm t = {};
     t.tm_year = gps.date.year()-1900; t.tm_mon = gps.date.month()-1; t.tm_mday = gps.date.day();
     t.tm_hour = gps.time.hour(); t.tm_min = gps.time.minute(); t.tm_sec = gps.time.second();
-    time_t epoch = mktime(&t);   // TZ is UTC (set in setup) so this == UTC epoch
+    time_t epoch = mktime(&t);
     struct timeval tv = { epoch, 0 };
     settimeofday(&tv, nullptr);
     Serial.println("Clock set from GPS.");
@@ -336,7 +350,7 @@ void feedGPS() {
 }
 
 // ---------------- Line-protocol build ----------------
-String ns2str(uint64_t ns) {            // Arduino String has no uint64_t ctor
+String ns2str(uint64_t ns) {
   char b[24]; snprintf(b, sizeof(b), "%llu", (unsigned long long)ns); return String(b);
 }
 void addF(String& s, const char* k, float v, bool& first) {
@@ -347,11 +361,10 @@ void addF(String& s, const char* k, float v, bool& first) {
 }
 void logSnapshot() {
   time_t now = time(nullptr);
-  if (now < 1700000000) return;                 // no valid time yet -> skip (GPS/NTP not ready)
+  if (now < 1700000000) return;
   uint64_t ns = (uint64_t)now * 1000000000ULL;
 
   String line;
-  // measurement: obd2
   line = "obd2,vehicle="; line += vehicleId; line += " ";
   bool first = true;
   addF(line,"rpm",v_rpm,first);      addF(line,"speed_mph",v_speedMph,first);
@@ -366,9 +379,8 @@ void logSnapshot() {
   addF(line,"mil_on",v_mil,first);        addF(line,"dtc_count",v_dtcCount,first);
   addF(line,"misfire",v_misfire,first);
   if (!first) { line += " "; line += ns2str(ns); line += "\n"; }
-  else line = "";                                // no OBD fields -> skip obd line
+  else line = "";
 
-  // measurement: gps
   if (!isnan(g_lat) && !isnan(g_lon)) {
     String gl = "gps,vehicle="; gl += vehicleId; gl += " ";
     bool gf = true;
@@ -377,7 +389,6 @@ void logSnapshot() {
     if (!gf) { gl += " "; gl += ns2str(ns); gl += "\n"; line += gl; }
   }
 
-  // measurement: system (ESP health -> graph memory/CPU in Grafana)
   {
     String sys = "system,vehicle="; sys += vehicleId; sys += " ";
     sys += "heap_free=" + String(ESP.getFreeHeap());
@@ -396,12 +407,12 @@ void logSnapshot() {
     File f = SD.open(BUF, FILE_APPEND);
     if (f) { f.print(line); f.close(); }
   } else {
-    Serial.print("[no SD] "); Serial.print(line);   // fallback: at least print it
+    Serial.print("[no SD] "); Serial.print(line);
   }
 }
 
-// ---------------- Uploader ----------------
-bool influxHttps() { return strcmp(influxPort, "443") == 0; }  // 443 -> use TLS
+// ---------------- InfluxDB uploader ----------------
+bool influxHttps() { return strcmp(influxPort, "443") == 0; }
 String influxUrl() {
   bool https = influxHttps();
   String u = https ? "https://" : "http://";
@@ -416,8 +427,6 @@ void flushBuffer() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (strlen(influxHost) == 0) return;
   if (!sdOk) return;
-
-  // If no pending upload, rotate current buffer into the upload slot.
   if (!SD.exists(UP)) {
     if (!SD.exists(BUF)) return;
     File b = SD.open(BUF, FILE_READ);
@@ -425,36 +434,90 @@ void flushBuffer() {
     if (sz == 0) return;
     SD.rename(BUF, UP);
   }
-
   File f = SD.open(UP, FILE_READ);
   if (!f) return;
   size_t sz = f.size();
   if (sz == 0) { f.close(); SD.remove(UP); return; }
-
   HTTPClient http;
   WiFiClientSecure tls;
   WiFiClient plain;
   int code;
   String auth = "Token "; auth += influxToken;
-  if (influxHttps()) {
-    tls.setInsecure();                 // skip cert validation (fine for a homelab)
-    http.begin(tls, influxUrl());
-  } else {
-    http.begin(plain, influxUrl());
-  }
+  if (influxHttps()) { tls.setInsecure(); http.begin(tls, influxUrl()); }
+  else               { http.begin(plain, influxUrl()); }
   http.addHeader("Content-Type", "text/plain; charset=utf-8");
   http.addHeader("Authorization", auth);
-  code = http.sendRequest("POST", &f, sz);   // streams file as body (no big RAM use)
+  code = http.sendRequest("POST", &f, sz);
   f.close();
   http.end();
   lastInfluxCode = code;
   lastInfluxMs = millis();
+  if (code == 204 || code == 200) { SD.remove(UP); Serial.printf("Uploaded %u bytes (HTTP %d).\n", (unsigned)sz, code); }
+  else Serial.printf("InfluxDB upload failed (HTTP %d).\n", code);
+}
 
-  if (code == 204 || code == 200) {
-    SD.remove(UP);
-    Serial.printf("Uploaded %u bytes to InfluxDB (HTTP %d).\n", (unsigned)sz, code);
-  } else {
-    Serial.printf("InfluxDB upload failed (HTTP %d); will retry.\n", code);
+// ---------------- MQTT -> Home Assistant (auto-discovery) ----------------
+struct MField { const char* key; const char* name; const char* unit; const char* dev; float* val; };
+MField mf[] = {
+  {"rpm",         "Engine RPM",         "rpm", "",            &v_rpm},
+  {"speed_mph",   "Vehicle Speed",      "mph", "speed",       &v_speedMph},
+  {"coolant_c",   "Coolant Temp",       "°C", "temperature", &v_coolant},
+  {"load_pct",    "Engine Load",        "%",   "",            &v_load},
+  {"throttle_pct","Throttle",           "%",   "",            &v_throttle},
+  {"intake_c",    "Intake Air Temp",    "°C", "temperature", &v_intake},
+  {"maf",         "MAF Rate",           "g/s", "",            &v_maf},
+  {"battery_v",   "Battery",            "V",   "voltage",     &v_vbat},
+  {"fuel_pct",    "Fuel Level",         "%",   "",            &v_fuel},
+  {"stft_b1",     "Short Fuel Trim B1", "%",   "",            &v_stft},
+  {"ltft_b1",     "Long Fuel Trim B1",  "%",   "",            &v_ltft},
+  {"timing_adv",  "Timing Advance",     "°",  "",        &v_timing},
+  {"map_kpa",     "Manifold Pressure",  "kPa", "pressure",    &v_map},
+  {"module_v",    "Module Voltage",     "V",   "voltage",     &v_modV},
+  {"runtime_s",   "Runtime",            "s",   "duration",    &v_runtime},
+  {"ambient_c",   "Ambient Temp",       "°C", "temperature", &v_ambient},
+  {"oil_c",       "Oil Temp",           "°C", "temperature", &v_oil},
+  {"mil_on",      "Check Engine (MIL)", "",    "",            &v_mil},
+  {"dtc_count",   "Trouble Codes",      "",    "",            &v_dtcCount},
+  {"misfire",     "Misfire",            "",    "",            &v_misfire},
+};
+const int MF_COUNT = sizeof(mf) / sizeof(mf[0]);
+
+void sendDiscovery() {
+  for (int i = 0; i < MF_COUNT; i++) {
+    String t = "homeassistant/sensor/esp32logger/" + String(mf[i].key) + "/config";
+    String p = "{";
+    p += "\"name\":\"" + String(mf[i].name) + "\",";
+    p += "\"uniq_id\":\"esp32logger_" + String(mf[i].key) + "\",";
+    p += "\"stat_t\":\"esp32logger/" + String(mf[i].key) + "\",";
+    p += "\"avty_t\":\"esp32logger/status\",";
+    if (strlen(mf[i].unit) > 0) p += "\"unit_of_meas\":\"" + String(mf[i].unit) + "\",";
+    if (strlen(mf[i].dev) > 0)  p += "\"dev_cla\":\"" + String(mf[i].dev) + "\",";
+    p += "\"stat_cla\":\"measurement\",";
+    p += "\"dev\":{\"ids\":[\"esp32logger\"],\"name\":\"ESP32 OBD2 Logger\",\"mf\":\"DIY\",\"mdl\":\"LoLin D32 Pro\"}";
+    p += "}";
+    mqtt.publish(t.c_str(), p.c_str(), true);
+  }
+}
+void mqttReconnect() {
+  if (strlen(mqttHost) == 0) return;
+  if (mqtt.connected()) return;
+  mqtt.setServer(mqttHost, atoi(mqttPort));
+  mqtt.setBufferSize(640);
+  String cid = "esp32logger-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  bool ok = strlen(mqttUser)
+    ? mqtt.connect(cid.c_str(), mqttUser, mqttPass, "esp32logger/status", 0, true, "offline")
+    : mqtt.connect(cid.c_str(), "esp32logger/status", 0, true, "offline");
+  if (ok) {
+    Serial.println("MQTT connected.");
+    mqtt.publish("esp32logger/status", "online", true);
+    sendDiscovery();
+  }
+}
+void publishMqtt() {
+  for (int i = 0; i < MF_COUNT; i++) {
+    if (isnan(*mf[i].val)) continue;
+    String tp = "esp32logger/" + String(mf[i].key);
+    mqtt.publish(tp.c_str(), String(*mf[i].val, 2).c_str(), true);
   }
 }
 
@@ -484,6 +547,7 @@ void handleRoot() {
   else if (lastInfluxCode == 200 || lastInfluxCode == 204) ist = "CONNECTED (last OK " + String((millis()-lastInfluxMs)/1000) + "s ago)";
   else                                              ist = "ERROR (HTTP " + String(lastInfluxCode) + ")";
   h += "<p><b>InfluxDB:</b> " + String(influxHost) + ":" + String(influxPort) + " / " + String(influxBucket) + " &mdash; " + ist + "</p>";
+  h += "<p><b>MQTT:</b> " + String(strlen(mqttHost)==0 ? "disabled" : (mqtt.connected()?"connected to "+String(mqttHost):"disconnected")) + "</p>";
   String faults;
   if (isnan(v_mil)) faults = "not read yet";
   else faults = String(v_mil>0.5?"MIL ON":"MIL off") + ", " + String((int)v_dtcCount) + " code(s)" + (v_misfire>0.5 ? ", MISFIRE code present" : "");
@@ -511,7 +575,7 @@ void handleRoot() {
 
   h += "<h3>System</h3><ul>";
   h += "<li>Uptime: " + String(millis()/1000) + " s</li>";
-  h += "<li>Free heap: " + String(ESP.getFreeHeap()) + " B (min " + String(ESP.getMinFreeHeap()) + ", largest block " + String(ESP.getMaxAllocHeap()) + ", total " + String(ESP.getHeapSize()) + ")</li>";
+  h += "<li>Free heap: " + String(ESP.getFreeHeap()) + " B (min " + String(ESP.getMinFreeHeap()) + ", largest block " + String(ESP.getMaxAllocHeap()) + ")</li>";
   h += "<li>PSRAM: free " + String(ESP.getFreePsram()) + " / " + String(ESP.getPsramSize()) + " B</li>";
   h += "<li>CPU: " + String(ESP.getCpuFreqMHz()) + " MHz &nbsp; loop rate " + String(loopRate) + "/s</li>";
   h += "<li>Chip temp: " + String(temperatureRead(), 1) + " C (rough)</li>";
@@ -529,12 +593,11 @@ void handleRoot() {
       h += " (up to date)";
     }
   }
-
   h += "<p><a href='/config'>/config</a> (edit settings) &middot; <a href='/manualupdate'>manual firmware upload</a></p></body></html>";
   server.send(200, "text/html", h);
 }
 
-// ---------------- Config web page (edit settings while on WiFi) ----------------
+// ---------------- Config web page ----------------
 void handleConfig() {
   String h = "<html><body><h2>Logger Configuration</h2>";
   h += "<form method='POST' action='/save'>";
@@ -542,8 +605,12 @@ void handleConfig() {
   h += "Port: <input name='port' value='" + String(influxPort) + "'><br><br>";
   h += "Org: <input name='org' value='" + String(influxOrg) + "'><br><br>";
   h += "Bucket: <input name='bucket' value='" + String(influxBucket) + "'><br><br>";
-  h += "Token (leave blank to keep current): <input name='token' value='' size='50'><br><br>";
-  h += "Vehicle tag: <input name='veh' value='" + String(vehicleId) + "'><br><br>";
+  h += "InfluxDB token (blank = keep): <input name='token' value='' size='40'><br><br>";
+  h += "<hr>MQTT host (blank = off): <input name='mh' value='" + String(mqttHost) + "'><br><br>";
+  h += "MQTT port: <input name='mp' value='" + String(mqttPort) + "'><br><br>";
+  h += "MQTT user: <input name='mu' value='" + String(mqttUser) + "'><br><br>";
+  h += "MQTT password (blank = keep): <input name='mpw' value=''><br><br>";
+  h += "<hr>Vehicle tag: <input name='veh' value='" + String(vehicleId) + "'><br><br>";
   h += "OBD2 Bluetooth MAC: <input name='mac' value='" + String(btMac) + "'><br><br>";
   h += "OBD2 Bluetooth PIN: <input name='pin' value='" + String(btPin) + "'><br><br>";
   h += "<hr>Static IP (blank = DHCP): <input name='sip' value='" + String(staticIP) + "'><br><br>";
@@ -551,7 +618,7 @@ void handleConfig() {
   h += "Subnet mask: <input name='ssn' value='" + String(staticSN) + "'><br><br>";
   h += "DNS server: <input name='sdns' value='" + String(staticDNS) + "'><br><br>";
   h += "<input type='submit' value='Save'></form>";
-  h += "<p><i>Static IP changes take effect after a reboot.</i></p>";
+  h += "<p><i>MQTT/static-IP changes take effect after a reboot.</i></p>";
   h += "<form method='POST' action='/reboot'><button>Reboot now</button></form>";
   h += "<p><a href='/'>&larr; status</a></p></body></html>";
   server.send(200, "text/html", h);
@@ -563,6 +630,11 @@ void handleSave() {
   if (server.hasArg("bucket")) snprintf(influxBucket, sizeof(influxBucket), "%s", server.arg("bucket").c_str());
   if (server.hasArg("token") && server.arg("token").length() > 0)
     snprintf(influxToken, sizeof(influxToken), "%s", server.arg("token").c_str());
+  if (server.hasArg("mh"))     snprintf(mqttHost,     sizeof(mqttHost),     "%s", server.arg("mh").c_str());
+  if (server.hasArg("mp"))     snprintf(mqttPort,     sizeof(mqttPort),     "%s", server.arg("mp").c_str());
+  if (server.hasArg("mu"))     snprintf(mqttUser,     sizeof(mqttUser),     "%s", server.arg("mu").c_str());
+  if (server.hasArg("mpw") && server.arg("mpw").length() > 0)
+    snprintf(mqttPass, sizeof(mqttPass), "%s", server.arg("mpw").c_str());
   if (server.hasArg("veh"))    snprintf(vehicleId,    sizeof(vehicleId),    "%s", server.arg("veh").c_str());
   if (server.hasArg("mac"))    snprintf(btMac,        sizeof(btMac),        "%s", server.arg("mac").c_str());
   if (server.hasArg("pin"))    snprintf(btPin,        sizeof(btPin),        "%s", server.arg("pin").c_str());
@@ -573,15 +645,13 @@ void handleSave() {
   saveConfig();
   Serial.println("Config updated via web page.");
   String h = "<html><body><h2>Saved.</h2>";
-  h += "<p>Sending to: " + String(influxHost) + ":" + String(influxPort) + " / bucket " + String(influxBucket) + "</p>";
-  h += "<p>Static IP: " + String(strlen(staticIP)?staticIP:"DHCP") + " (reboot to apply)</p>";
+  h += "<p>Influx: " + String(influxHost) + " / " + String(influxBucket) + " &nbsp; MQTT: " + String(strlen(mqttHost)?mqttHost:"off") + "</p>";
+  h += "<p>Reboot to apply MQTT / static IP.</p>";
   h += "<p><a href='/config'>&larr; edit again</a> &middot; <a href='/'>status</a></p></body></html>";
   server.send(200, "text/html", h);
 }
 
 // ---------------- OTA self-update (manual) ----------------
-// Pause Bluetooth (frees ~40KB so the TLS fetch fits), grab latest version.
-// BT is left down on purpose; loop() re-connects it so the web server stays responsive.
 String fetchLatestVersion() {
   SerialBT.end(); btConnected=false; elmReady=false; delay(150);
   WiFiClientSecure c; c.setInsecure();
@@ -602,24 +672,24 @@ void handleCheckUpdate() {
   updateAvailable = (latest.length() > 0 && latest != String(FW_VERSION));
   Serial.printf("[OTA] check: running=%s latest=%s (%s) avail=%d\n", FW_VERSION, latestVersion, lastCheckMsg, updateAvailable);
   server.sendHeader("Location", "/");
-  server.send(303);   // back to dashboard
+  server.send(303);
 }
 void handleDoUpdate() {
-  server.send(200, "text/html", "<html><body><h3>Updating...</h3><p>Downloading firmware and rebooting. Give it ~30s, then <a href='/'>reload</a>.</p></body></html>");
+  server.send(200, "text/html", "<html><body><h3>Updating...</h3><p>Downloading firmware and rebooting. ~30s, then <a href='/'>reload</a>.</p></body></html>");
   delay(300);
-  Serial.println("[OTA] Manual update starting; pausing Bluetooth for RAM.");
+  Serial.println("[OTA] Manual update; pausing Bluetooth for RAM.");
   SerialBT.end(); btConnected=false; elmReady=false; delay(200);
   WiFiClientSecure uc; uc.setInsecure();
   httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   httpUpdate.rebootOnUpdate(true);
-  t_httpUpdate_return r = httpUpdate.update(uc, BIN_URL);   // reboots on success
+  t_httpUpdate_return r = httpUpdate.update(uc, BIN_URL);
   if (r == HTTP_UPDATE_FAILED) {
     Serial.printf("[OTA] failed (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
-    connectOBD();   // resume BT; user can retry
+    connectOBD();
   }
 }
 
-// ---------------- Manual firmware upload (browser fallback OTA) ----------------
+// ---------------- Manual firmware upload ----------------
 void handleManualPage() {
   String h = "<html><body><h2>Manual firmware upload</h2>";
   h += "<p>Upload <b>logger-app-ota.bin</b> (the app image -- NOT logger-firmware.bin).</p>";
@@ -640,7 +710,7 @@ void handleUpload() {
   HTTPUpload& u = server.upload();
   if (u.status == UPLOAD_FILE_START) {
     Serial.printf("[OTA] Manual upload: %s\n", u.filename.c_str());
-    SerialBT.end(); btConnected=false; elmReady=false;   // free RAM for the write
+    SerialBT.end(); btConnected=false; elmReady=false;
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
   } else if (u.status == UPLOAD_FILE_WRITE) {
     if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
@@ -658,18 +728,16 @@ void handleReboot() {
 void setup() {
   Serial.begin(115200);
   delay(1200);
-  setenv("TZ", "UTC0", 1); tzset();            // work in UTC for clean epoch timestamps
+  setenv("TZ", "UTC0", 1); tzset();
   Serial.println("\n==== ESP32 OBD2 Logger boot ====");
   Serial.printf("FW %s | Reset reason: %d | heap: %u\n", FW_VERSION, (int)esp_reset_reason(), ESP.getFreeHeap());
 
   loadConfig();
 
-  // SD card -- retry a few times; some cards need a moment after power-up
   SPI.begin(18, 19, 23, SD_CS);
   for (int i = 0; i < 5 && !sdOk; i++) { sdOk = SD.begin(SD_CS); if (!sdOk) delay(400); }
   Serial.printf("SD card: %s\n", sdOk ? "OK" : "FAILED (reformat FAT32 / reseat / check power)");
 
-  // GPS UART
   GPSserial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   Serial.println("GPS serial started.");
 
@@ -684,7 +752,7 @@ void setup() {
   server.on("/doupload", HTTP_POST, handleUploadDone, handleUpload);
   server.on("/reboot", HTTP_POST, handleReboot);
   server.begin();
-  Serial.println("HTTP server up (/, /config, /checkupdate, /manualupdate).");
+  Serial.println("HTTP server up.");
 
   connectOBD();
 }
@@ -693,7 +761,6 @@ void loop() {
   server.handleClient();
   feedGPS();
 
-  // Loop-rate counter (CPU-headroom proxy) + SD auto-retry if it failed to mount
   loopCount++;
   if (millis() - lastRateMs >= 1000) { loopRate = loopCount; loopCount = 0; lastRateMs = millis(); }
   if (!sdOk && millis() - lastSdRetryMs > 10000) {
@@ -702,31 +769,29 @@ void loop() {
     if (sdOk) Serial.println("SD card mounted (retry).");
   }
 
-  // Keep OBD alive
   if (!btConnected || !elmReady) {
     if (millis() - lastConnTryMs > 5000) { lastConnTryMs = millis(); elmReady=false; connectOBD(); }
   } else {
     pollOBD();
   }
 
-  // Periodic trouble-code / misfire check (blocking, runs once a minute)
-  if (elmReady && millis() - lastDtcMs > DTC_INTERVAL) {
-    lastDtcMs = millis();
-    checkDTCs();
-  }
+  if (elmReady && millis() - lastDtcMs > DTC_INTERVAL) { lastDtcMs = millis(); checkDTCs(); }
 
-  // Snapshot to buffer
   if (millis() - lastLogMs > LOG_INTERVAL) { lastLogMs = millis(); logSnapshot(); }
-
-  // Flush buffer to InfluxDB
   if (millis() - lastUploadMs > UPLOAD_INTERVAL) { lastUploadMs = millis(); flushBuffer(); }
 
-  // Heartbeat
+  // MQTT -> Home Assistant
+  if (strlen(mqttHost) > 0 && WiFi.status() == WL_CONNECTED) {
+    if (!mqtt.connected()) mqttReconnect();
+    mqtt.loop();
+    if (mqtt.connected() && millis() - lastMqttMs > MQTT_PUB_INTERVAL) { lastMqttMs = millis(); publishMqtt(); }
+  }
+
   if (millis() - lastBeatMs > 10000) {
     lastBeatMs = millis();
-    Serial.printf("[beat] up=%lus heap=%u WiFi=%s SD=%d buf=%u BT=%d GPSsat=%u timeOK=%d\n",
+    Serial.printf("[beat] up=%lus heap=%u WiFi=%s SD=%d buf=%u BT=%d MQTT=%d GPSsat=%u timeOK=%d\n",
                   millis()/1000, ESP.getFreeHeap(),
                   WiFi.status()==WL_CONNECTED?"yes":"no", sdOk, (unsigned)bufBytes(),
-                  btConnected, g_sats, time(nullptr) > 1700000000);
+                  btConnected, mqtt.connected(), g_sats, time(nullptr) > 1700000000);
   }
 }
