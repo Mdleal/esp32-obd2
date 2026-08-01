@@ -1,0 +1,17 @@
+[Unit]
+Description=CHIP OBD2/GPS logger -> MQTT (HA) + InfluxDB
+After=network-online.target bluetooth.service gpsd.service wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/chip-logger.env
+# Bind the Veepeak to /dev/rfcomm0 before the logger starts (idempotent).
+ExecStartPre=-/usr/bin/rfcomm bind 0 00:1D:A5:07:5D:3C 1
+ExecStart=/usr/bin/python3 /opt/chip-logger/logger.py
+ExecStopPost=-/usr/bin/rfcomm release 0
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
