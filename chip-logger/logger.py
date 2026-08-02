@@ -216,7 +216,7 @@ def influx_loop():
         if time.time() - last >= UPLOAD_INTERVAL:
             last = time.time()
             try:
-                data = BUF.read_bytes()
+                data = BUF.read_bytes() if BUF.exists() else b""
                 if data and INFLUX_TOKEN:
                     r = requests.post(influx_write_url(),
                                       headers={"Authorization": f"Token {INFLUX_TOKEN}",
@@ -253,7 +253,10 @@ def on_connect(cli, u, flags, rc, props=None):
     mqtt_discovery(cli)
 
 def mqtt_loop():
-    cli = mqtt.Client(client_id=f"{DEV_ID}-chip")
+    try:
+        cli = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=f"{DEV_ID}-chip")
+    except (AttributeError, TypeError):
+        cli = mqtt.Client(client_id=f"{DEV_ID}-chip")
     if MQTT_USER: cli.username_pw_set(MQTT_USER, MQTT_PASS)
     cli.will_set(f"{BASE}/status", "offline", retain=True)
     cli.on_connect = on_connect
